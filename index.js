@@ -9,6 +9,8 @@ import { createServer } from 'http'
 import { Server as SocketIOServer } from 'socket.io'
 import { randomUUID } from 'crypto'
 import axios from 'axios'
+import fs from 'fs'
+import path from 'path'
 
 const app = express()
 const ORIGIN = process.env.WEB_ORIGIN || ''
@@ -29,9 +31,62 @@ app.use(cookieParser())
 // trust proxy for correct secure cookies behind Fly/Proxies
 app.set('trust proxy', 1)
 
-// In-memory message history (ephemeral). Consider DB for persistence.
+// Message history in memory + JSONL file persistence
 const MESSAGE_HISTORY_LIMIT = Number(process.env.MESSAGE_HISTORY_LIMIT || 500)
 const messageHistory = []
+
+// JSONL persistence settings
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
+const MESSAGES_FILE = process.env.MESSAGES_FILE || path.join(DATA_DIR, 'messages.jsonl')
+
+function ensureDataDir() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true })
+  } catch (err) {
+    console.error('[messages] failed to create data dir:', err?.message || err)
+  }
+}
+
+function appendMessageToFile(message) {
+  try {
+    const line = JSON.stringify(message) + '\n'
+    fs.promises.appendFile(MESSAGES_FILE, line).catch((err) => {
+      console.error('[messages] append failed:', err?.message || err)
+    })
+  } catch (err) {
+    console.error('[messages] append error:', err?.message || err)
+  }
+}
+
+function loadHistoryFromFile() {
+  ensureDataDir()
+  if (!fs.existsSync(MESSAGES_FILE)) return
+  try {
+    const content = fs.readFileSync(MESSAGES_FILE, 'utf8')
+    const lines = content.split(/\r?\n/)
+    for (const line of lines) {
+      if (!line.trim()) continue
+      try {
+        const parsed = JSON.parse(line)
+        if (parsed && typeof parsed === 'object') {
+          messageHistory.push(parsed)
+        }
+      } catch {
+        // ignore bad line
+      }
+    }
+    // keep only the latest up to limit
+    if (messageHistory.length > MESSAGE_HISTORY_LIMIT) {
+      const start = messageHistory.length - MESSAGE_HISTORY_LIMIT
+      messageHistory.splice(0, start)
+    }
+    console.log(`[messages] loaded ${messageHistory.length} messages from file`)
+  } catch (err) {
+    console.error('[messages] load failed:', err?.message || err)
+  }
+}
+
+loadHistoryFromFile()
 
 const isHttps = (ORIGIN || '').startsWith('https://')
 const sessionMiddleware = session({
@@ -143,6 +198,9 @@ io.on('connection', (socket) => {
     messageHistory.push(message)
     if (messageHistory.length > MESSAGE_HISTORY_LIMIT) messageHistory.shift()
 
+    // Persist to JSONL file
+    appendMessageToFile(message)
+
     // Bridge to DDNet webhook if provided
     if (process.env.DDNET_WEBHOOK_URL && message.content) {
       try {
@@ -181,6 +239,7 @@ app.post('/bridge/ddnet/incoming', (req, res) => {
   io.emit('chat:message', bridged)
   messageHistory.push(bridged)
   if (messageHistory.length > MESSAGE_HISTORY_LIMIT) messageHistory.shift()
+  appendMessageToFile(bridged)
   res.sendStatus(204)
 })
 
