@@ -11,6 +11,10 @@ import { randomUUID } from 'crypto'
 import axios from 'axios'
 
 const app = express()
+const ORIGIN = process.env.WEB_ORIGIN || ''
+if (!ORIGIN) {
+  console.warn('[WARN] WEB_ORIGIN is not set. Falling back to http://localhost:5173 for redirects.')
+}
 const httpServer = createServer(app)
 const io = new SocketIOServer(httpServer, {
   cors: {
@@ -19,19 +23,22 @@ const io = new SocketIOServer(httpServer, {
   },
 })
 
-app.use(cors({ origin: process.env.WEB_ORIGIN || 'http://localhost:5173', credentials: true }))
+app.use(cors({ origin: ORIGIN || 'http://localhost:5173', credentials: true }))
 app.use(express.json())
 app.use(cookieParser())
+// trust proxy for correct secure cookies behind Fly/Proxies
+app.set('trust proxy', 1)
 
 // In-memory message history (ephemeral). Consider DB for persistence.
 const MESSAGE_HISTORY_LIMIT = Number(process.env.MESSAGE_HISTORY_LIMIT || 500)
 const messageHistory = []
 
+const isHttps = (ORIGIN || '').startsWith('https://')
 const sessionMiddleware = session({
   secret: process.env.SESSION_SECRET || 'dev_secret_change_me',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false },
+  cookie: { secure: isHttps, sameSite: 'lax' },
 })
 app.use(sessionMiddleware)
 
@@ -73,12 +80,11 @@ app.get('/auth/discord', passport.authenticate('discord'))
 app.get(
   '/auth/discord/callback',
   passport.authenticate('discord', {
-    failureRedirect: `${process.env.WEB_ORIGIN || 'http://localhost:5173'}/`,
+    failureRedirect: `${ORIGIN || 'http://localhost:5173'}/`,
   }),
   (req, res) => {
     // 로그인 성공: 프런트엔드로 복귀
-    const origin = process.env.WEB_ORIGIN || 'http://localhost:5173'
-    res.redirect(origin)
+    res.redirect(ORIGIN || 'http://localhost:5173')
   },
 )
 
