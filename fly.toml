@@ -10,6 +10,7 @@ primary_region = 'nrt'
 
 [env]
   PORT = "4000"
+  DATA_DIR = "/data"
 
 [http_service]
   internal_port = 4000
@@ -18,6 +19,10 @@ primary_region = 'nrt'
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
+
+[[mounts]]
+  source = "messages_data"
+  destination = "/data"
 
 [[vm]]
   memory = '1gb'
