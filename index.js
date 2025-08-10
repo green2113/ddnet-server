@@ -219,6 +219,39 @@ io.on('connection', (socket) => {
       }
     }
   })
+
+  // Delete message (owner only)
+  socket.on('chat:delete', async (payload) => {
+    try {
+      const messageId = payload?.id
+      if (!messageId) return
+      const sessUser = socket.request?.session?.passport?.user
+      if (!sessUser) return
+
+      let deleted = false
+      if (messagesCol) {
+        // Find the message to verify ownership
+        const found = await messagesCol.findOne({ id: messageId }, { projection: { author: 1, user_id: 1 } })
+        const authorId = found?.author?.id || found?.user_id
+        if (authorId && authorId === sessUser.id) {
+          const r = await messagesCol.deleteOne({ id: messageId })
+          deleted = r.deletedCount > 0
+        }
+      } else {
+        const idx = messageHistory.findIndex((m) => m.id === messageId)
+        if (idx >= 0 && messageHistory[idx].author?.id === sessUser.id) {
+          messageHistory.splice(idx, 1)
+          deleted = true
+        }
+      }
+
+      if (deleted) {
+        io.emit('chat:delete', messageId)
+      }
+    } catch (err) {
+      console.error('[delete] failed', err?.message || err)
+    }
+  })
 })
 
 const port = Number(process.env.PORT || 4000)
