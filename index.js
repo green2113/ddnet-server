@@ -118,6 +118,31 @@ app.get('/api/me', (req, res) => {
   res.json(null)
 })
 
+// Normalize stored rows (both legacy flat docs and new nested docs) to message shape
+function normalizeMessageRow(row) {
+  const hasNestedAuthor = row && typeof row === 'object' && row.author && typeof row.author === 'object'
+  const author = hasNestedAuthor
+    ? {
+        id: row.author.id || row.user_id || 'web',
+        username: row.author.username || row.username || 'WebUser',
+        displayName: row.author.displayName || row.display_name || row.username || 'WebUser',
+        avatar: row.author.avatar ?? row.avatar ?? null,
+      }
+    : {
+        id: row?.user_id || 'web',
+        username: row?.username || 'WebUser',
+        displayName: row?.display_name || row?.username || 'WebUser',
+        avatar: row?.avatar ?? null,
+      }
+  return {
+    id: row?.id,
+    author,
+    content: row?.content || '',
+    source: row?.source || 'web',
+    timestamp: row?.timestamp || row?.ts || Date.now(),
+  }
+}
+
 app.get('/api/history', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, MESSAGE_HISTORY_LIMIT)
   if (messagesCol) {
@@ -127,7 +152,8 @@ app.get('/api/history', async (req, res) => {
         .sort({ ts: 1 })
         .limit(limit)
         .toArray()
-      return res.json(rows)
+      const normalized = rows.map(normalizeMessageRow)
+      return res.json(normalized)
     } catch (e) {
       console.error('[mongo] history failed', e?.message || e)
     }
@@ -168,16 +194,8 @@ io.on('connection', (socket) => {
 
     // Persist
     if (messagesCol) {
-      const doc = {
-        id: message.id,
-        user_id: message.author.id,
-        username: message.author.username,
-        display_name: message.author.displayName,
-        avatar: message.author.avatar,
-        content: message.content,
-        source: message.source,
-        ts: message.timestamp,
-      }
+      // Store in the same shape as runtime message for simplicity; keep ts for sorting/index
+      const doc = { ...message, ts: message.timestamp }
       messagesCol.insertOne(doc).catch((e) => console.error('[mongo] insert failed', e?.message || e))
     } else {
       messageHistory.push(message)
@@ -221,16 +239,7 @@ app.post('/bridge/ddnet/incoming', (req, res) => {
   }
   io.emit('chat:message', bridged)
   if (messagesCol) {
-    const doc = {
-      id: bridged.id,
-      user_id: bridged.author.id,
-      username: bridged.author.username,
-      display_name: bridged.author.displayName,
-      avatar: bridged.author.avatar,
-      content: bridged.content,
-      source: bridged.source,
-      ts: bridged.timestamp,
-    }
+    const doc = { ...bridged, ts: bridged.timestamp }
     messagesCol.insertOne(doc).catch((e) => console.error('[mongo] insert failed', e?.message || e))
   } else {
     messageHistory.push(bridged)
