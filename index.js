@@ -9,8 +9,7 @@ import { createServer } from 'http'
 import { Server as SocketIOServer } from 'socket.io'
 import { randomUUID } from 'crypto'
 import axios from 'axios'
-import fs from 'fs'
-import path from 'path'
+import { MongoClient } from 'mongodb'
 
 const app = express()
 const ORIGIN = process.env.WEB_ORIGIN || ''
@@ -31,62 +30,24 @@ app.use(cookieParser())
 // trust proxy for correct secure cookies behind Fly/Proxies
 app.set('trust proxy', 1)
 
-// Message history in memory + JSONL file persistence
+// Message history in memory (fallback when MongoDB is not configured)
 const MESSAGE_HISTORY_LIMIT = Number(process.env.MESSAGE_HISTORY_LIMIT || 500)
 const messageHistory = []
 
-// JSONL persistence settings
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
-const MESSAGES_FILE = process.env.MESSAGES_FILE || path.join(DATA_DIR, 'messages.jsonl')
-
-function ensureDataDir() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true })
-  } catch (err) {
-    console.error('[messages] failed to create data dir:', err?.message || err)
-  }
+// Prefer MongoDB if configured; otherwise use JSONL file
+let mongoClient
+let messagesCol
+async function initMongo() {
+  const uri = process.env.MONGODB_URI
+  if (!uri) return
+  mongoClient = new MongoClient(uri)
+  await mongoClient.connect()
+  const db = mongoClient.db(process.env.MONGO_DB || 'ddnet')
+  messagesCol = db.collection(process.env.MONGO_COLL || 'messages')
+  await messagesCol.createIndex({ ts: 1 })
+  console.log('[mongo] connected')
 }
-
-function appendMessageToFile(message) {
-  try {
-    const line = JSON.stringify(message) + '\n'
-    fs.promises.appendFile(MESSAGES_FILE, line).catch((err) => {
-      console.error('[messages] append failed:', err?.message || err)
-    })
-  } catch (err) {
-    console.error('[messages] append error:', err?.message || err)
-  }
-}
-
-function loadHistoryFromFile() {
-  ensureDataDir()
-  if (!fs.existsSync(MESSAGES_FILE)) return
-  try {
-    const content = fs.readFileSync(MESSAGES_FILE, 'utf8')
-    const lines = content.split(/\r?\n/)
-    for (const line of lines) {
-      if (!line.trim()) continue
-      try {
-        const parsed = JSON.parse(line)
-        if (parsed && typeof parsed === 'object') {
-          messageHistory.push(parsed)
-        }
-      } catch {
-        // ignore bad line
-      }
-    }
-    // keep only the latest up to limit
-    if (messageHistory.length > MESSAGE_HISTORY_LIMIT) {
-      const start = messageHistory.length - MESSAGE_HISTORY_LIMIT
-      messageHistory.splice(0, start)
-    }
-    console.log(`[messages] loaded ${messageHistory.length} messages from file`)
-  } catch (err) {
-    console.error('[messages] load failed:', err?.message || err)
-  }
-}
-
-loadHistoryFromFile()
+initMongo().catch((e) => console.error('[mongo] init failed', e?.message || e))
 
 const isHttps = (ORIGIN || '').startsWith('https://')
 const sessionMiddleware = session({
@@ -157,8 +118,20 @@ app.get('/api/me', (req, res) => {
   res.json(null)
 })
 
-app.get('/api/history', (req, res) => {
+app.get('/api/history', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, MESSAGE_HISTORY_LIMIT)
+  if (messagesCol) {
+    try {
+      const rows = await messagesCol
+        .find({}, { projection: { _id: 0 } })
+        .sort({ ts: 1 })
+        .limit(limit)
+        .toArray()
+      return res.json(rows)
+    } catch (e) {
+      console.error('[mongo] history failed', e?.message || e)
+    }
+  }
   const start = Math.max(messageHistory.length - limit, 0)
   res.json(messageHistory.slice(start))
 })
@@ -193,12 +166,23 @@ io.on('connection', (socket) => {
     // Broadcast to web clients
     io.emit('chat:message', message)
 
-    // Save into in-memory history
-    messageHistory.push(message)
-    if (messageHistory.length > MESSAGE_HISTORY_LIMIT) messageHistory.shift()
-
-    // Persist to JSONL file
-    appendMessageToFile(message)
+    // Persist
+    if (messagesCol) {
+      const doc = {
+        id: message.id,
+        user_id: message.author.id,
+        username: message.author.username,
+        display_name: message.author.displayName,
+        avatar: message.author.avatar,
+        content: message.content,
+        source: message.source,
+        ts: message.timestamp,
+      }
+      messagesCol.insertOne(doc).catch((e) => console.error('[mongo] insert failed', e?.message || e))
+    } else {
+      messageHistory.push(message)
+      if (messageHistory.length > MESSAGE_HISTORY_LIMIT) messageHistory.shift()
+    }
 
     // Bridge to DDNet webhook if provided
     if (process.env.DDNET_WEBHOOK_URL && message.content) {
@@ -236,9 +220,22 @@ app.post('/bridge/ddnet/incoming', (req, res) => {
     source: 'ddnet',
   }
   io.emit('chat:message', bridged)
-  messageHistory.push(bridged)
-  if (messageHistory.length > MESSAGE_HISTORY_LIMIT) messageHistory.shift()
-  appendMessageToFile(bridged)
+  if (messagesCol) {
+    const doc = {
+      id: bridged.id,
+      user_id: bridged.author.id,
+      username: bridged.author.username,
+      display_name: bridged.author.displayName,
+      avatar: bridged.author.avatar,
+      content: bridged.content,
+      source: bridged.source,
+      ts: bridged.timestamp,
+    }
+    messagesCol.insertOne(doc).catch((e) => console.error('[mongo] insert failed', e?.message || e))
+  } else {
+    messageHistory.push(bridged)
+    if (messageHistory.length > MESSAGE_HISTORY_LIMIT) messageHistory.shift()
+  }
   res.sendStatus(204)
 })
 
