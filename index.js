@@ -93,7 +93,6 @@ const sessionMiddleware = session({
   secret: process.env.SESSION_SECRET || 'dev_secret_change_me',
   resave: false,
   saveUninitialized: false,
-  // Cross-site (Pages 도메인 ↔ Fly 서버) 쿠키 전송을 위해 SameSite=None + Secure 필요
   cookie: { secure: isHttps, sameSite: 'none' },
 })
 app.use(sessionMiddleware)
