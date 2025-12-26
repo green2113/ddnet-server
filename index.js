@@ -34,10 +34,12 @@ app.set('trust proxy', 1)
 // Message history in memory (fallback when MongoDB is not configured)
 const MESSAGE_HISTORY_LIMIT = Number(process.env.MESSAGE_HISTORY_LIMIT || 500)
 const messageHistory = []
+const GENERAL_CHANNEL_ID = '1000'
+const DDNET_CHANNEL_ID = '1001'
 
 const defaultChannels = () => [
-  { id: 'general', name: 'general', hidden: false, createdAt: Date.now(), createdBy: 'system' },
-  { id: 'ddnet-bridge', name: 'ddnet-bridge', hidden: false, createdAt: Date.now(), createdBy: 'system' },
+  { id: GENERAL_CHANNEL_ID, name: 'general', hidden: false, createdAt: Date.now(), createdBy: 'system' },
+  { id: DDNET_CHANNEL_ID, name: 'ddnet-bridge', hidden: false, createdAt: Date.now(), createdBy: 'system' },
 ]
 
 let channels = defaultChannels()
@@ -100,6 +102,12 @@ async function removeChannel(channelId) {
     return
   }
   channels = channels.filter((channel) => channel.id !== channelId)
+}
+
+function generateChannelId() {
+  const stamp = Date.now().toString()
+  const suffix = Math.floor(1000 + Math.random() * 9000).toString()
+  return `${stamp}${suffix}`
 }
 
 const isHttps = (ORIGIN || '').startsWith('https://')
@@ -189,7 +197,7 @@ app.post('/api/channels', async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return res.status(400).json({ error: 'name required' })
   const channel = {
-    id: randomUUID(),
+    id: generateChannelId(),
     name,
     hidden: false,
     createdAt: Date.now(),
@@ -266,18 +274,20 @@ function normalizeMessageRow(row) {
     author,
     content: row?.content || '',
     source: row?.source || 'web',
-    channelId: row?.channelId || 'general',
+    channelId: row?.channelId || GENERAL_CHANNEL_ID,
     timestamp: row?.timestamp || row?.ts || Date.now(),
   }
 }
 
 app.get('/api/history', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, MESSAGE_HISTORY_LIMIT)
-  const channelId = String(req.query.channelId || 'general')
+  const channelId = String(req.query.channelId || GENERAL_CHANNEL_ID)
+  const legacyChannelId = channelId === GENERAL_CHANNEL_ID ? 'general' : channelId === DDNET_CHANNEL_ID ? 'ddnet-bridge' : null
+  const channelQuery = legacyChannelId ? { $in: [channelId, legacyChannelId] } : channelId
   if (messagesCol) {
     try {
       const rows = await messagesCol
-        .find({ channelId }, { projection: { _id: 0 } })
+        .find({ channelId: channelQuery }, { projection: { _id: 0 } })
         .sort({ ts: 1 })
         .limit(limit)
         .toArray()
@@ -287,7 +297,9 @@ app.get('/api/history', async (req, res) => {
       console.error('[mongo] history failed', e?.message || e)
     }
   }
-  const filtered = messageHistory.filter((message) => message.channelId === channelId)
+  const filtered = messageHistory.filter((message) =>
+    legacyChannelId ? message.channelId === channelId || message.channelId === legacyChannelId : message.channelId === channelId,
+  )
   const start = Math.max(filtered.length - limit, 0)
   res.json(filtered.slice(start))
 })
@@ -306,7 +318,7 @@ io.on('connection', (socket) => {
     if (!sessUser) {
       return // ignore unauthenticated send
     }
-    const channelId = typeof payload?.channelId === 'string' ? payload.channelId : 'general'
+    const channelId = typeof payload?.channelId === 'string' ? payload.channelId : GENERAL_CHANNEL_ID
     const channel = await getChannelById(channelId)
     if (!channel) return
     if (channel.hidden && !isAdminId(sessUser?.id)) return
@@ -402,7 +414,7 @@ app.post('/bridge/ddnet/incoming', (req, res) => {
     id: randomUUID(),
     author: { id: 'ddnet', username: author || 'DDNet' },
     content,
-    channelId: 'ddnet-bridge',
+    channelId: DDNET_CHANNEL_ID,
     timestamp: timestamp || Date.now(),
     source: 'ddnet',
   }
