@@ -158,7 +158,11 @@ const sessionMiddleware = session({
   secret: process.env.SESSION_SECRET || 'dev_secret_change_me',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: isHttps, sameSite: 'none' },
+  cookie: {
+    secure: isHttps,
+    sameSite: isHttps ? 'none' : 'lax',
+    httpOnly: true,
+  },
 })
 app.use(sessionMiddleware)
 
@@ -222,8 +226,8 @@ app.get('/api/me', (req, res) => {
   res.json(null)
 })
 
+// ✅ 관리자 목록: 표시용으로 전체 공개 (쓰기/삭제는 관리자만)
 app.get('/api/admins', async (req, res) => {
-  if (!isAdminId(req.user?.id)) return res.status(403).json({ error: 'forbidden' })
   try {
     const admins = await listAdmins()
     res.json(admins)
@@ -495,7 +499,7 @@ io.on('connection', (socket) => {
     }
   })
 
-  // Delete message (owner only)
+  // Delete message (owner or admin)
   socket.on('chat:delete', async (payload) => {
     try {
       const messageId = payload?.id
@@ -503,20 +507,28 @@ io.on('connection', (socket) => {
       const sessUser = socket.request?.session?.passport?.user
       if (!sessUser) return
 
+      const isAdmin = isAdminId(sessUser.id)
       let deleted = false
+
       if (messagesCol) {
-        // Find the message to verify ownership
-        const found = await messagesCol.findOne({ id: messageId }, { projection: { author: 1, user_id: 1 } })
-        const authorId = found?.author?.id || found?.user_id
-        if (authorId && authorId === sessUser.id) {
+        if (isAdmin) {
           const r = await messagesCol.deleteOne({ id: messageId })
           deleted = r.deletedCount > 0
+        } else {
+          const found = await messagesCol.findOne({ id: messageId }, { projection: { author: 1, user_id: 1 } })
+          const authorId = found?.author?.id || found?.user_id
+          if (authorId && authorId === sessUser.id) {
+            const r = await messagesCol.deleteOne({ id: messageId })
+            deleted = r.deletedCount > 0
+          }
         }
       } else {
         const idx = messageHistory.findIndex((m) => m.id === messageId)
-        if (idx >= 0 && messageHistory[idx].author?.id === sessUser.id) {
-          messageHistory.splice(idx, 1)
-          deleted = true
+        if (idx >= 0) {
+          if (isAdmin || messageHistory[idx].author?.id === sessUser.id) {
+            messageHistory.splice(idx, 1)
+            deleted = true
+          }
         }
       }
 
