@@ -484,6 +484,8 @@ io.on('connection', (socket) => {
       username: sessUser.username,
       displayName: sessUser.displayName,
       avatar: sessUser.avatar || null,
+      muted: false,
+      deafened: false,
     })
     socket.join(`voice:${channelId}`)
     emitVoiceMembers(channelId)
@@ -520,6 +522,20 @@ io.on('connection', (socket) => {
     const targetId = String(payload?.targetId || '')
     if (!channelId || !targetId) return
     io.to(targetId).emit('voice:ice', { channelId, fromId: socket.id, candidate: payload?.candidate })
+  })
+
+  socket.on('voice:status', (payload) => {
+    const channelId = String(payload?.channelId || '')
+    if (!channelId) return
+    const channelMembers = voiceMembers.get(channelId)
+    if (!channelMembers?.has(socket.id)) return
+    const current = channelMembers.get(socket.id)
+    channelMembers.set(socket.id, {
+      ...current,
+      muted: Boolean(payload?.muted),
+      deafened: Boolean(payload?.deafened),
+    })
+    emitVoiceMembers(channelId)
   })
 
   socket.on('disconnect', () => {
