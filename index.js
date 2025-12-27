@@ -12,7 +12,7 @@ import axios from 'axios'
 import { MongoClient } from 'mongodb'
 
 const app = express()
-const ADMIN_ID = '776421522188664843'
+const DEFAULT_ADMIN_IDS = ['776421522188664843']
 const ORIGIN = process.env.WEB_ORIGIN || ''
 if (!ORIGIN) {
   console.warn('[WARN] WEB_ORIGIN is not set. Falling back to http://localhost:5173 for redirects.')
@@ -41,8 +41,9 @@ const defaultChannels = () => [
 ]
 
 let channels = defaultChannels()
+let adminIds = [...DEFAULT_ADMIN_IDS]
 
-const isAdminId = (userId) => userId === ADMIN_ID
+const isAdminId = (userId) => Boolean(userId) && adminIds.includes(userId)
 
 async function listChannels() {
   if (channelsCol) {
@@ -84,6 +85,7 @@ async function removeChannel(channelId) {
 let mongoClient
 let messagesCol
 let channelsCol
+let adminsCol
 async function initMongo() {
   const uri = process.env.MONGODB_URI
   if (!uri) return
@@ -94,20 +96,53 @@ async function initMongo() {
   await messagesCol.createIndex({ ts: 1 })
   channelsCol = db.collection(process.env.MONGO_CHANNELS_COLL || 'channels')
   await channelsCol.createIndex({ name: 1 }, { unique: true })
+  adminsCol = db.collection(process.env.MONGO_ADMINS_COLL || 'admins')
+  await adminsCol.createIndex({ id: 1 }, { unique: true })
   const existing = await channelsCol.countDocuments()
   if (existing === 0) {
     await channelsCol.insertMany(defaultChannels())
   }
+  const adminCount = await adminsCol.countDocuments()
+  if (adminCount === 0) {
+    await adminsCol.insertMany(DEFAULT_ADMIN_IDS.map((id) => ({ id })))
+  }
   console.log('[mongo] connected')
 }
 initMongo().catch((e) => console.error('[mongo] init failed', e?.message || e))
+
+async function listAdmins() {
+  if (adminsCol) {
+    const rows = await adminsCol.find({}, { projection: { _id: 0 } }).toArray()
+    adminIds = rows.map((row) => row.id)
+    return adminIds
+  }
+  return adminIds
+}
+
+async function addAdmin(id) {
+  if (adminsCol) {
+    await adminsCol.updateOne({ id }, { $set: { id } }, { upsert: true })
+  } else if (!adminIds.includes(id)) {
+    adminIds.push(id)
+  }
+  return listAdmins()
+}
+
+async function removeAdmin(id) {
+  if (adminsCol) {
+    await adminsCol.deleteOne({ id })
+  } else {
+    adminIds = adminIds.filter((existing) => existing !== id)
+  }
+  return listAdmins()
+}
 
 const isHttps = (ORIGIN || '').startsWith('https://')
 const sessionMiddleware = session({
   secret: process.env.SESSION_SECRET || 'dev_secret_change_me',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: isHttps, sameSite: 'none' },
+  cookie: { secure: isHttps, sameSite: isHttps ? 'none' : 'lax' },
 })
 app.use(sessionMiddleware)
 
@@ -169,6 +204,42 @@ app.post('/auth/logout', (req, res) => {
 app.get('/api/me', (req, res) => {
   if (req.user) return res.json(req.user)
   res.json(null)
+})
+
+app.get('/api/admins', async (req, res) => {
+  try {
+    const admins = await listAdmins()
+    res.json(admins)
+  } catch (e) {
+    console.error('[admins] list failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load admins' })
+  }
+})
+
+app.post('/api/admins', async (req, res) => {
+  if (!isAdminId(req.user?.id)) return res.status(403).json({ error: 'forbidden' })
+  const id = String(req.body?.id || '').trim()
+  if (!id) return res.status(400).json({ error: 'id required' })
+  try {
+    const admins = await addAdmin(id)
+    res.status(201).json(admins)
+  } catch (e) {
+    console.error('[admins] add failed', e?.message || e)
+    res.status(500).json({ error: 'failed to add admin' })
+  }
+})
+
+app.delete('/api/admins/:id', async (req, res) => {
+  if (!isAdminId(req.user?.id)) return res.status(403).json({ error: 'forbidden' })
+  const id = String(req.params.id || '').trim()
+  if (!id) return res.status(400).json({ error: 'id required' })
+  try {
+    const admins = await removeAdmin(id)
+    res.json(admins)
+  } catch (e) {
+    console.error('[admins] remove failed', e?.message || e)
+    res.status(500).json({ error: 'failed to remove admin' })
+  }
 })
 
 app.get('/api/channels', async (req, res) => {
