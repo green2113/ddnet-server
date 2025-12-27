@@ -38,8 +38,8 @@ const GENERAL_CHANNEL_ID = '1000'
 const DDNET_CHANNEL_ID = '1001'
 
 const defaultChannels = () => [
-  { id: GENERAL_CHANNEL_ID, name: 'general', hidden: false, createdAt: Date.now(), createdBy: 'system' },
-  { id: DDNET_CHANNEL_ID, name: 'ddnet-bridge', hidden: false, createdAt: Date.now(), createdBy: 'system' },
+  { id: GENERAL_CHANNEL_ID, name: 'general', hidden: false, order: 0, createdAt: Date.now(), createdBy: 'system' },
+  { id: DDNET_CHANNEL_ID, name: 'ddnet-bridge', hidden: false, order: 1, createdAt: Date.now(), createdBy: 'system' },
 ]
 
 let channels = defaultChannels()
@@ -68,7 +68,13 @@ async function initMongo() {
 }
 initMongo().catch((e) => console.error('[mongo] init failed', e?.message || e))
 
-const sortChannels = (items) => items.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+const sortChannels = (items) =>
+  items.slice().sort((a, b) => {
+    const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER
+    const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER
+    if (orderA !== orderB) return orderA - orderB
+    return (a.createdAt || 0) - (b.createdAt || 0)
+  })
 
 async function listChannels() {
   if (channelsCol) {
@@ -198,10 +204,13 @@ app.post('/api/channels', async (req, res) => {
   if (!isAdminId(userId)) return res.status(403).json({ error: 'forbidden' })
   const name = String(req.body?.name || '').trim()
   if (!name) return res.status(400).json({ error: 'name required' })
+  const existing = await listChannels()
+  const maxOrder = existing.reduce((max, channel) => (typeof channel.order === 'number' && channel.order > max ? channel.order : max), -1)
   const channel = {
     id: generateChannelId(),
     name,
     hidden: false,
+    order: maxOrder + 1,
     createdAt: Date.now(),
     createdBy: userId,
   }
@@ -271,6 +280,32 @@ app.patch('/api/channels/:id/name', async (req, res) => {
   } catch (e) {
     console.error('[channels] rename failed', e?.message || e)
     res.status(500).json({ error: 'failed to rename channel' })
+  }
+})
+
+app.patch('/api/channels/order', async (req, res) => {
+  const userId = req.user?.id
+  if (!isAdminId(userId)) return res.status(403).json({ error: 'forbidden' })
+  const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map(String) : []
+  if (!orderedIds.length) return res.status(400).json({ error: 'orderedIds required' })
+  try {
+    if (channelsCol) {
+      await Promise.all(
+        orderedIds.map((id, index) =>
+          channelsCol.updateOne({ id }, { $set: { order: index } }, { upsert: false }),
+        ),
+      )
+    } else {
+      channels = channels.map((channel) => {
+        const idx = orderedIds.indexOf(channel.id)
+        return idx >= 0 ? { ...channel, order: idx } : channel
+      })
+    }
+    io.emit('channels:update')
+    res.sendStatus(204)
+  } catch (e) {
+    console.error('[channels] reorder failed', e?.message || e)
+    res.status(500).json({ error: 'failed to reorder channels' })
   }
 })
 
