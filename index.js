@@ -415,6 +415,7 @@ const voiceMembers = new Map()
 const emitVoiceMembers = (channelId) => {
   const members = Array.from(voiceMembers.get(channelId)?.values() || [])
   io.to(`voice:${channelId}`).emit('voice:members', { channelId, members })
+  io.to(`voice:watch:${channelId}`).emit('voice:members', { channelId, members })
 }
 
 io.on('connection', (socket) => {
@@ -422,6 +423,21 @@ io.on('connection', (socket) => {
     const sess = socket.request?.session
     return sess?.passport?.user || sess?.guestUser
   }
+
+  socket.on('voice:watch', async (payload) => {
+    const channelId = String(payload?.channelId || '')
+    if (!channelId) return
+    const channel = await getChannelById(channelId)
+    if (!channel || channel.type !== 'voice') return
+    socket.join(`voice:watch:${channelId}`)
+    emitVoiceMembers(channelId)
+  })
+
+  socket.on('voice:unwatch', (payload) => {
+    const channelId = String(payload?.channelId || '')
+    if (!channelId) return
+    socket.leave(`voice:watch:${channelId}`)
+  })
 
   socket.on('chat:send', async (payload) => {
     const sessUser = resolveSessionUser()
