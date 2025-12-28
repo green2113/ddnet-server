@@ -36,14 +36,16 @@ const MESSAGE_HISTORY_LIMIT = Number(process.env.MESSAGE_HISTORY_LIMIT || 500)
 const messageHistory = []
 
 const defaultChannels = () => [
-  { id: 'general', name: 'general', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system' },
-  { id: 'ddnet-bridge', name: 'ddnet-bridge', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system' },
+  { id: '1000', name: 'general', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system' },
+  { id: '1001', name: 'ddnet-bridge', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system' },
 ]
 
 let channels = defaultChannels()
 let adminIds = [...DEFAULT_ADMIN_IDS]
 
 const isAdminId = (userId) => Boolean(userId) && adminIds.includes(userId)
+
+const generateChannelId = () => `${Date.now()}${Math.floor(Math.random() * 9000 + 1000)}`
 
 async function listChannels() {
   if (channelsCol) {
@@ -299,7 +301,7 @@ app.post('/api/channels', async (req, res) => {
   if (!name) return res.status(400).json({ error: 'name required' })
   const type = req.body?.type === 'voice' ? 'voice' : 'text'
   const channel = {
-    id: randomUUID(),
+    id: generateChannelId(),
     name,
     type,
     hidden: false,
