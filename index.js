@@ -12,7 +12,7 @@ import axios from 'axios'
 import { MongoClient } from 'mongodb'
 
 const app = express()
-const ADMIN_ID = '776421522188664843'
+const DEFAULT_ADMIN_IDS = ['776421522188664843']
 const ORIGIN = process.env.WEB_ORIGIN || ''
 if (!ORIGIN) {
   console.warn('[WARN] WEB_ORIGIN is not set. Falling back to http://localhost:5173 for redirects.')
@@ -36,20 +36,21 @@ const MESSAGE_HISTORY_LIMIT = Number(process.env.MESSAGE_HISTORY_LIMIT || 500)
 const messageHistory = []
 
 const defaultChannels = () => [
-  { id: 'general', name: 'general', hidden: false, createdAt: Date.now(), createdBy: 'system' },
-  { id: 'ddnet-bridge', name: 'ddnet-bridge', hidden: false, createdAt: Date.now(), createdBy: 'system' },
+  { id: 'general', name: 'general', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system' },
+  { id: 'ddnet-bridge', name: 'ddnet-bridge', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system' },
 ]
 
 let channels = defaultChannels()
+let adminIds = [...DEFAULT_ADMIN_IDS]
 
-const isAdminId = (userId) => userId === ADMIN_ID
+const isAdminId = (userId) => Boolean(userId) && adminIds.includes(userId)
 
 async function listChannels() {
   if (channelsCol) {
     const rows = await channelsCol.find({}, { projection: { _id: 0 } }).toArray()
-    return rows.map((row) => ({ ...row, hidden: !!row.hidden }))
+    return rows.map((row) => ({ ...row, type: row.type === 'voice' ? 'voice' : 'text', hidden: !!row.hidden }))
   }
-  return channels
+  return channels.map((channel) => ({ ...channel, type: channel.type === 'voice' ? 'voice' : 'text' }))
 }
 
 async function getChannelById(channelId) {
@@ -84,6 +85,7 @@ async function removeChannel(channelId) {
 let mongoClient
 let messagesCol
 let channelsCol
+let adminsCol
 async function initMongo() {
   const uri = process.env.MONGODB_URI
   if (!uri) return
@@ -94,22 +96,57 @@ async function initMongo() {
   await messagesCol.createIndex({ ts: 1 })
   channelsCol = db.collection(process.env.MONGO_CHANNELS_COLL || 'channels')
   await channelsCol.createIndex({ name: 1 }, { unique: true })
+  adminsCol = db.collection(process.env.MONGO_ADMINS_COLL || 'admins')
+  await adminsCol.createIndex({ id: 1 }, { unique: true })
   const existing = await channelsCol.countDocuments()
   if (existing === 0) {
     await channelsCol.insertMany(defaultChannels())
   }
+  const adminCount = await adminsCol.countDocuments()
+  if (adminCount === 0) {
+    await adminsCol.insertMany(DEFAULT_ADMIN_IDS.map((id) => ({ id })))
+  }
   console.log('[mongo] connected')
 }
 initMongo().catch((e) => console.error('[mongo] init failed', e?.message || e))
+
+async function listAdmins() {
+  if (adminsCol) {
+    const rows = await adminsCol.find({}, { projection: { _id: 0 } }).toArray()
+    adminIds = rows.map((row) => row.id)
+    return adminIds
+  }
+  return adminIds
+}
+
+async function addAdmin(id) {
+  if (adminsCol) {
+    await adminsCol.updateOne({ id }, { $set: { id } }, { upsert: true })
+  } else if (!adminIds.includes(id)) {
+    adminIds.push(id)
+  }
+  return listAdmins()
+}
+
+async function removeAdmin(id) {
+  if (adminsCol) {
+    await adminsCol.deleteOne({ id })
+  } else {
+    adminIds = adminIds.filter((existing) => existing !== id)
+  }
+  return listAdmins()
+}
 
 const isHttps = (ORIGIN || '').startsWith('https://')
 const sessionMiddleware = session({
   secret: process.env.SESSION_SECRET || 'dev_secret_change_me',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: isHttps, sameSite: 'none' },
+  cookie: { secure: isHttps, sameSite: isHttps ? 'none' : 'lax' },
 })
 app.use(sessionMiddleware)
+
+const DEFAULT_GUEST_AVATAR = 'https://cdn.discordapp.com/embed/avatars/0.png'
 
 passport.serializeUser((user, done) => {
   done(null, user)
@@ -154,6 +191,7 @@ const sanitizeReturnTo = (value) => {
 app.get(
   '/auth/discord',
   (req, _res, next) => {
+    if (req.session?.guestUser) delete req.session.guestUser
     const returnTo = sanitizeReturnTo(req.query?.return_to)
     if (returnTo) {
       req.session.returnTo = returnTo
@@ -186,8 +224,60 @@ app.post('/auth/logout', (req, res) => {
 })
 
 app.get('/api/me', (req, res) => {
-  if (req.user) return res.json(req.user)
+  if (req.user) return res.json({ ...req.user, isGuest: false })
+  if (req.session?.guestUser) return res.json(req.session.guestUser)
   res.json(null)
+})
+
+app.post('/auth/guest', (req, res) => {
+  const name = String(req.body?.name || '').trim()
+  if (!name) return res.status(400).json({ error: 'name required' })
+  const displayName = name.slice(0, 20)
+  const guestUser = {
+    id: req.session?.guestUser?.id || `guest:${randomUUID()}`,
+    username: displayName,
+    displayName,
+    avatar: DEFAULT_GUEST_AVATAR,
+    isGuest: true,
+  }
+  req.session.guestUser = guestUser
+  res.status(201).json(guestUser)
+})
+
+app.get('/api/admins', async (req, res) => {
+  try {
+    const admins = await listAdmins()
+    res.json(admins)
+  } catch (e) {
+    console.error('[admins] list failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load admins' })
+  }
+})
+
+app.post('/api/admins', async (req, res) => {
+  if (!isAdminId(req.user?.id)) return res.status(403).json({ error: 'forbidden' })
+  const id = String(req.body?.id || '').trim()
+  if (!id) return res.status(400).json({ error: 'id required' })
+  try {
+    const admins = await addAdmin(id)
+    res.status(201).json(admins)
+  } catch (e) {
+    console.error('[admins] add failed', e?.message || e)
+    res.status(500).json({ error: 'failed to add admin' })
+  }
+})
+
+app.delete('/api/admins/:id', async (req, res) => {
+  if (!isAdminId(req.user?.id)) return res.status(403).json({ error: 'forbidden' })
+  const id = String(req.params.id || '').trim()
+  if (!id) return res.status(400).json({ error: 'id required' })
+  try {
+    const admins = await removeAdmin(id)
+    res.json(admins)
+  } catch (e) {
+    console.error('[admins] remove failed', e?.message || e)
+    res.status(500).json({ error: 'failed to remove admin' })
+  }
 })
 
 app.get('/api/channels', async (req, res) => {
@@ -207,9 +297,11 @@ app.post('/api/channels', async (req, res) => {
   if (!isAdminId(userId)) return res.status(403).json({ error: 'forbidden' })
   const name = String(req.body?.name || '').trim()
   if (!name) return res.status(400).json({ error: 'name required' })
+  const type = req.body?.type === 'voice' ? 'voice' : 'text'
   const channel = {
     id: randomUUID(),
     name,
+    type,
     hidden: false,
     createdAt: Date.now(),
     createdBy: userId,
@@ -318,10 +410,21 @@ io.use((socket, next) => {
   next()
 })
 
+const voiceMembers = new Map()
+
+const emitVoiceMembers = (channelId) => {
+  const members = Array.from(voiceMembers.get(channelId)?.values() || [])
+  io.to(`voice:${channelId}`).emit('voice:members', { channelId, members })
+}
+
 io.on('connection', (socket) => {
-  socket.on('chat:send', async (payload) => {
+  const resolveSessionUser = () => {
     const sess = socket.request?.session
-    const sessUser = sess?.passport?.user
+    return sess?.passport?.user || sess?.guestUser
+  }
+
+  socket.on('chat:send', async (payload) => {
+    const sessUser = resolveSessionUser()
     if (!sessUser) {
       return // ignore unauthenticated send
     }
@@ -379,7 +482,7 @@ io.on('connection', (socket) => {
     try {
       const messageId = payload?.id
       if (!messageId) return
-      const sessUser = socket.request?.session?.passport?.user
+      const sessUser = resolveSessionUser()
       if (!sessUser) return
 
       let deleted = false
@@ -405,6 +508,86 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error('[delete] failed', err?.message || err)
     }
+  })
+
+  socket.on('voice:join', async (payload) => {
+    const sessUser = resolveSessionUser()
+    if (!sessUser) return
+    const channelId = String(payload?.channelId || '')
+    if (!channelId) return
+    const channel = await getChannelById(channelId)
+    if (!channel || channel.type !== 'voice') return
+    if (!voiceMembers.has(channelId)) {
+      voiceMembers.set(channelId, new Map())
+    }
+    const channelMembers = voiceMembers.get(channelId)
+    channelMembers.set(socket.id, {
+      id: socket.id,
+      username: sessUser.username,
+      displayName: sessUser.displayName,
+      avatar: sessUser.avatar || null,
+      muted: false,
+      deafened: false,
+    })
+    socket.join(`voice:${channelId}`)
+    emitVoiceMembers(channelId)
+  })
+
+  socket.on('voice:leave', (payload) => {
+    const channelId = String(payload?.channelId || '')
+    if (!channelId) return
+    const channelMembers = voiceMembers.get(channelId)
+    if (channelMembers?.has(socket.id)) {
+      channelMembers.delete(socket.id)
+      socket.leave(`voice:${channelId}`)
+      emitVoiceMembers(channelId)
+      io.to(`voice:${channelId}`).emit('voice:leave', { channelId, peerId: socket.id })
+    }
+  })
+
+  socket.on('voice:offer', (payload) => {
+    const channelId = String(payload?.channelId || '')
+    const targetId = String(payload?.targetId || '')
+    if (!channelId || !targetId) return
+    io.to(targetId).emit('voice:offer', { channelId, fromId: socket.id, sdp: payload?.sdp })
+  })
+
+  socket.on('voice:answer', (payload) => {
+    const channelId = String(payload?.channelId || '')
+    const targetId = String(payload?.targetId || '')
+    if (!channelId || !targetId) return
+    io.to(targetId).emit('voice:answer', { channelId, fromId: socket.id, sdp: payload?.sdp })
+  })
+
+  socket.on('voice:ice', (payload) => {
+    const channelId = String(payload?.channelId || '')
+    const targetId = String(payload?.targetId || '')
+    if (!channelId || !targetId) return
+    io.to(targetId).emit('voice:ice', { channelId, fromId: socket.id, candidate: payload?.candidate })
+  })
+
+  socket.on('voice:status', (payload) => {
+    const channelId = String(payload?.channelId || '')
+    if (!channelId) return
+    const channelMembers = voiceMembers.get(channelId)
+    if (!channelMembers?.has(socket.id)) return
+    const current = channelMembers.get(socket.id)
+    channelMembers.set(socket.id, {
+      ...current,
+      muted: Boolean(payload?.muted),
+      deafened: Boolean(payload?.deafened),
+    })
+    emitVoiceMembers(channelId)
+  })
+
+  socket.on('disconnect', () => {
+    voiceMembers.forEach((members, channelId) => {
+      if (members.has(socket.id)) {
+        members.delete(socket.id)
+        emitVoiceMembers(channelId)
+        io.to(`voice:${channelId}`).emit('voice:leave', { channelId, peerId: socket.id })
+      }
+    })
   })
 })
 
