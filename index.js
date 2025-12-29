@@ -403,7 +403,7 @@ app.get('/api/history', async (req, res) => {
   const filtered = messageHistory.filter((message) => message.channelId === channelId)
   const start = Math.max(filtered.length - limit, 0)
   res.json(filtered.slice(start))
-})
+}
 
 // (Discord 봇 미사용) 디스코드 채널 브릿지는 제거되었습니다.
 
@@ -502,19 +502,20 @@ io.on('connection', (socket) => {
       if (!messageId) return
       const sessUser = resolveSessionUser()
       if (!sessUser) return
+      const canDeleteAny = isAdminId(sessUser.id)
 
       let deleted = false
       if (messagesCol) {
         // Find the message to verify ownership
         const found = await messagesCol.findOne({ id: messageId }, { projection: { author: 1, user_id: 1 } })
         const authorId = found?.author?.id || found?.user_id
-        if (authorId && authorId === sessUser.id) {
+        if (authorId && (authorId === sessUser.id || canDeleteAny)) {
           const r = await messagesCol.deleteOne({ id: messageId })
           deleted = r.deletedCount > 0
         }
       } else {
         const idx = messageHistory.findIndex((m) => m.id === messageId)
-        if (idx >= 0 && messageHistory[idx].author?.id === sessUser.id) {
+        if (idx >= 0 && (messageHistory[idx].author?.id === sessUser.id || canDeleteAny)) {
           messageHistory.splice(idx, 1)
           deleted = true
         }
@@ -544,8 +545,8 @@ io.on('connection', (socket) => {
       username: sessUser.username,
       displayName: sessUser.displayName,
       avatar: sessUser.avatar || null,
-      muted: false,
-      deafened: false,
+      muted: Boolean(payload?.muted),
+      deafened: Boolean(payload?.deafened),
     })
     socket.join(`voice:${channelId}`)
     emitVoiceMembers(channelId)
@@ -557,6 +558,9 @@ io.on('connection', (socket) => {
     const channelMembers = voiceMembers.get(channelId)
     if (channelMembers?.has(socket.id)) {
       channelMembers.delete(socket.id)
+      if (channelMembers.size === 0) {
+        voiceMembers.delete(channelId)
+      }
       socket.leave(`voice:${channelId}`)
       emitVoiceMembers(channelId)
       io.to(`voice:${channelId}`).emit('voice:leave', { channelId, peerId: socket.id })
@@ -602,6 +606,9 @@ io.on('connection', (socket) => {
     voiceMembers.forEach((members, channelId) => {
       if (members.has(socket.id)) {
         members.delete(socket.id)
+        if (members.size === 0) {
+          voiceMembers.delete(channelId)
+        }
         emitVoiceMembers(channelId)
         io.to(`voice:${channelId}`).emit('voice:leave', { channelId, peerId: socket.id })
       }
