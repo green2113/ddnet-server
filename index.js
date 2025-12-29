@@ -403,7 +403,7 @@ app.get('/api/history', async (req, res) => {
   const filtered = messageHistory.filter((message) => message.channelId === channelId)
   const start = Math.max(filtered.length - limit, 0)
   res.json(filtered.slice(start))
-}
+})
 
 // (Discord 봇 미사용) 디스코드 채널 브릿지는 제거되었습니다.
 
@@ -617,8 +617,9 @@ io.on('connection', (socket) => {
 })
 
 const port = Number(process.env.PORT || 4000)
-httpServer.listen(port, () => {
-  console.log(`Server listening on http://localhost:${port}`)
+const host = process.env.HOST || '0.0.0.0'
+httpServer.listen(port, host, () => {
+  console.log(`Server listening on http://${host}:${port}`)
 })
 
 // HTTP endpoint to accept DDNet -> Web incoming messages
