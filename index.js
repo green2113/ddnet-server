@@ -536,6 +536,17 @@ io.on('connection', (socket) => {
     if (!channelId) return
     const channel = await getChannelById(channelId)
     if (!channel || channel.type !== 'voice') return
+    voiceMembers.forEach((members, existingChannelId) => {
+      if (existingChannelId === channelId) return
+      if (!members.has(socket.id)) return
+      members.delete(socket.id)
+      if (members.size === 0) {
+        voiceMembers.delete(existingChannelId)
+      }
+      socket.leave(`voice:${existingChannelId}`)
+      emitVoiceMembers(existingChannelId)
+      io.to(`voice:${existingChannelId}`).emit('voice:leave', { channelId: existingChannelId, peerId: socket.id })
+    })
     if (!voiceMembers.has(channelId)) {
       voiceMembers.set(channelId, new Map())
     }
