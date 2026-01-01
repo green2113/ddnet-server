@@ -10,6 +10,9 @@ import { Server as SocketIOServer } from 'socket.io'
 import { randomUUID } from 'crypto'
 import axios from 'axios'
 import { MongoClient } from 'mongodb'
+import multer from 'multer'
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 
 const app = express()
 const DEFAULT_ADMIN_IDS = ['776421522188664843']
@@ -149,6 +152,47 @@ const sessionMiddleware = session({
 app.use(sessionMiddleware)
 
 const DEFAULT_GUEST_AVATAR = 'https://cdn.discordapp.com/embed/avatars/0.png'
+const UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
+const R2_ENDPOINT = process.env.R2_ENDPOINT || ''
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || ''
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || ''
+const R2_BUCKET = process.env.R2_BUCKET || ''
+const R2_REGION = process.env.R2_REGION || 'auto'
+const SIGNED_URL_EXPIRES_SECONDS = 60 * 60 * 24 * 7
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: UPLOAD_LIMIT_BYTES },
+})
+
+const getSessionUser = (req) => req.user || req.session?.guestUser || null
+
+const r2Client = R2_ENDPOINT && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY
+  ? new S3Client({
+      region: R2_REGION,
+      endpoint: R2_ENDPOINT,
+      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+      forcePathStyle: true,
+    })
+  : null
+
+const safeFilename = (value) => {
+  const trimmed = String(value || '').trim().replace(/[\\/]/g, '_')
+  const cleaned = trimmed.replace(/[^\w.\-()\s]/g, '_')
+  return cleaned || 'file'
+}
+
+const buildSignedUrl = async (key) => {
+  if (!r2Client || !R2_BUCKET) return ''
+  return getSignedUrl(
+    r2Client,
+    new GetObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+    }),
+    { expiresIn: SIGNED_URL_EXPIRES_SECONDS }
+  )
+}
 
 passport.serializeUser((user, done) => {
   done(null, user)
@@ -403,6 +447,40 @@ app.get('/api/history', async (req, res) => {
   const filtered = messageHistory.filter((message) => message.channelId === channelId)
   const start = Math.max(filtered.length - limit, 0)
   res.json(filtered.slice(start))
+})
+
+app.post('/api/upload', upload.single('file'), async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  if (!r2Client || !R2_BUCKET) {
+    return res.status(500).json({ error: 'upload not configured' })
+  }
+  const channelId = String(req.body?.channelId || '')
+  if (!channelId) return res.status(400).json({ error: 'channelId required' })
+  const channel = await getChannelById(channelId)
+  if (!channel) return res.status(404).json({ error: 'channel not found' })
+  const file = req.file
+  if (!file) return res.status(400).json({ error: 'file required' })
+  if (file.mimetype?.startsWith('video/')) return res.status(400).json({ error: 'video not allowed' })
+
+  const filename = safeFilename(file.originalname)
+  const attachmentId = randomUUID()
+  const key = `attachments/${channelId}/${attachmentId}/${filename}`
+  try {
+    await r2Client.send(
+      new PutObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: key,
+        Body: file.buffer,
+        ContentType: file.mimetype || 'application/octet-stream',
+      }),
+    )
+    const url = await buildSignedUrl(key)
+    res.status(201).json({ url, key, size: file.size, mime: file.mimetype || 'application/octet-stream' })
+  } catch (err) {
+    console.error('[upload] failed', err?.message || err)
+    res.status(500).json({ error: 'upload failed' })
+  }
 })
 
 // (Discord 봇 미사용) 디스코드 채널 브릿지는 제거되었습니다.
