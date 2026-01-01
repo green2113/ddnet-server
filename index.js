@@ -153,6 +153,15 @@ app.use(sessionMiddleware)
 
 const DEFAULT_GUEST_AVATAR = 'https://cdn.discordapp.com/embed/avatars/0.png'
 const UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
+const ALLOWED_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+  'application/pdf',
+  'text/plain',
+  'application/zip',
+])
 const R2_ENDPOINT = process.env.R2_ENDPOINT || ''
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || ''
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || ''
@@ -461,7 +470,9 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!channel) return res.status(404).json({ error: 'channel not found' })
   const file = req.file
   if (!file) return res.status(400).json({ error: 'file required' })
-  if (file.mimetype?.startsWith('video/')) return res.status(400).json({ error: 'video not allowed' })
+  if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
+    return res.status(400).json({ error: 'file type not allowed' })
+  }
 
   const filename = safeFilename(file.originalname)
   const attachmentId = randomUUID()
