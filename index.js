@@ -11,8 +11,7 @@ import { randomUUID } from 'crypto'
 import axios from 'axios'
 import { MongoClient } from 'mongodb'
 import multer from 'multer'
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3'
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 
 const app = express()
 const DEFAULT_ADMIN_IDS = ['776421522188664843']
@@ -167,7 +166,7 @@ const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || ''
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || ''
 const R2_BUCKET = process.env.R2_BUCKET || ''
 const R2_REGION = process.env.R2_REGION || 'auto'
-const SIGNED_URL_EXPIRES_SECONDS = 60 * 60 * 24 * 7
+const R2_PUBLIC_BASE_URL = process.env.R2_PUBLIC_BASE_URL || ''
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -191,16 +190,17 @@ const safeFilename = (value) => {
   return cleaned || 'file'
 }
 
-const buildSignedUrl = async (key) => {
-  if (!r2Client || !R2_BUCKET) return ''
-  return getSignedUrl(
-    r2Client,
-    new GetObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: key,
-    }),
-    { expiresIn: SIGNED_URL_EXPIRES_SECONDS }
-  )
+const buildPublicUrl = (key) => {
+  const base = String(R2_PUBLIC_BASE_URL || '').replace(/\/$/, '')
+  if (!base) return ''
+  const encoded = key.split('/').map((part) => encodeURIComponent(part)).join('/')
+  return `${base}/${encoded}`
+}
+
+const generateAttachmentId = () => {
+  const now = Date.now().toString()
+  const rand = Math.floor(Math.random() * 1_000_000).toString().padStart(6, '0')
+  return `${now}${rand}`
 }
 
 passport.serializeUser((user, done) => {
@@ -461,7 +461,7 @@ app.get('/api/history', async (req, res) => {
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   const user = getSessionUser(req)
   if (!user) return res.status(401).json({ error: 'unauthorized' })
-  if (!r2Client || !R2_BUCKET) {
+  if (!r2Client || !R2_BUCKET || !R2_PUBLIC_BASE_URL) {
     return res.status(500).json({ error: 'upload not configured' })
   }
   const channelId = String(req.body?.channelId || '')
@@ -475,7 +475,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 
   const filename = safeFilename(file.originalname)
-  const attachmentId = randomUUID()
+  const attachmentId = generateAttachmentId()
   const key = `attachments/${channelId}/${attachmentId}/${filename}`
   try {
     await r2Client.send(
@@ -486,7 +486,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
         ContentType: file.mimetype || 'application/octet-stream',
       }),
     )
-    const url = await buildSignedUrl(key)
+    const url = buildPublicUrl(key)
     res.status(201).json({ url, key, size: file.size, mime: file.mimetype || 'application/octet-stream' })
   } catch (err) {
     console.error('[upload] failed', err?.message || err)
