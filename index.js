@@ -23,13 +23,20 @@ const corsOrigins = (process.env.CORS_ORIGINS || ORIGIN || 'http://localhost:517
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean)
+const allowAllOrigins = corsOrigins.includes('*')
 const allowNullOrigin = corsOrigins.includes('null')
+const allowFileOrigin = corsOrigins.includes('file://') || corsOrigins.includes('file')
+const allowAppOrigin = corsOrigins.includes('app://')
 const corsOriginSet = new Set(corsOrigins)
 
 const corsOriginHandler = (origin, callback) => {
+  if (allowAllOrigins) return callback(null, true)
   if (!origin) return callback(null, true)
   if (origin === 'null' && allowNullOrigin) return callback(null, true)
+  if (origin.startsWith('file://') && (allowNullOrigin || allowFileOrigin)) return callback(null, true)
+  if (origin.startsWith('app://') && allowAppOrigin) return callback(null, true)
   if (corsOriginSet.has(origin)) return callback(null, true)
+  console.warn(`[cors] blocked origin: ${origin}`)
   return callback(new Error(`Not allowed by CORS: ${origin}`))
 }
 const httpServer = createServer(app)
