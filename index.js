@@ -502,6 +502,7 @@ io.use((socket, next) => {
 })
 
 const voiceMembers = new Map()
+const voiceMembersByUser = new Map()
 
 const emitVoiceMembers = (channelId) => {
   const members = Array.from(voiceMembers.get(channelId)?.values() || [])
@@ -639,7 +640,25 @@ io.on('connection', (socket) => {
     if (!voiceMembers.has(channelId)) {
       voiceMembers.set(channelId, new Map())
     }
+    if (!voiceMembersByUser.has(channelId)) {
+      voiceMembersByUser.set(channelId, new Map())
+    }
     const channelMembers = voiceMembers.get(channelId)
+    const channelMembersByUser = voiceMembersByUser.get(channelId)
+    const userId = sessUser.id
+    if (userId) {
+      const existingSocketId = channelMembersByUser.get(userId)
+      if (existingSocketId && existingSocketId !== socket.id) {
+        const existingSocket = io.sockets.sockets.get(existingSocketId)
+        if (channelMembers?.has(existingSocketId)) {
+          channelMembers.delete(existingSocketId)
+          io.to(`voice:${channelId}`).emit('voice:leave', { channelId, peerId: existingSocketId })
+        }
+        existingSocket?.leave(`voice:${channelId}`)
+        io.to(existingSocketId).emit('voice:force-leave', { channelId })
+      }
+      channelMembersByUser.set(userId, socket.id)
+    }
     channelMembers.set(socket.id, {
       id: socket.id,
       username: sessUser.username,
@@ -656,14 +675,24 @@ io.on('connection', (socket) => {
     const channelId = String(payload?.channelId || '')
     if (!channelId) return
     const channelMembers = voiceMembers.get(channelId)
+    const channelMembersByUser = voiceMembersByUser.get(channelId)
     if (channelMembers?.has(socket.id)) {
       channelMembers.delete(socket.id)
       if (channelMembers.size === 0) {
         voiceMembers.delete(channelId)
+        voiceMembersByUser.delete(channelId)
       }
       socket.leave(`voice:${channelId}`)
       emitVoiceMembers(channelId)
       io.to(`voice:${channelId}`).emit('voice:leave', { channelId, peerId: socket.id })
+    }
+    if (channelMembersByUser) {
+      for (const [userId, socketId] of channelMembersByUser.entries()) {
+        if (socketId === socket.id) {
+          channelMembersByUser.delete(userId)
+          break
+        }
+      }
     }
   })
 
@@ -708,9 +737,19 @@ io.on('connection', (socket) => {
         members.delete(socket.id)
         if (members.size === 0) {
           voiceMembers.delete(channelId)
+          voiceMembersByUser.delete(channelId)
         }
         emitVoiceMembers(channelId)
         io.to(`voice:${channelId}`).emit('voice:leave', { channelId, peerId: socket.id })
+      }
+      const channelMembersByUser = voiceMembersByUser.get(channelId)
+      if (channelMembersByUser) {
+        for (const [userId, socketId] of channelMembersByUser.entries()) {
+          if (socketId === socket.id) {
+            channelMembersByUser.delete(userId)
+            break
+          }
+        }
       }
     })
   })
