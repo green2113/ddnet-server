@@ -38,8 +38,8 @@ const MESSAGE_HISTORY_LIMIT = Number(process.env.MESSAGE_HISTORY_LIMIT || 500)
 const messageHistory = []
 
 const defaultChannels = () => [
-  { id: '1000', name: 'general', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system' },
-  { id: '1001', name: 'ddnet-bridge', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system' },
+  { id: '1000', name: 'general', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system', order: 0 },
+  { id: '1001', name: 'ddnet-bridge', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system', order: 1 },
 ]
 
 let channels = defaultChannels()
@@ -52,9 +52,28 @@ const generateChannelId = () => `${Date.now()}${Math.floor(Math.random() * 9000 
 async function listChannels() {
   if (channelsCol) {
     const rows = await channelsCol.find({}, { projection: { _id: 0 } }).toArray()
-    return rows.map((row) => ({ ...row, type: row.type === 'voice' ? 'voice' : 'text', hidden: !!row.hidden }))
+    return rows
+      .map((row, index) => ({
+        ...row,
+        order: Number.isFinite(row.order) ? row.order : (Number.isFinite(row.createdAt) ? row.createdAt : index),
+        type: row.type === 'voice' ? 'voice' : 'text',
+        hidden: !!row.hidden,
+      }))
+      .sort((a, b) => {
+        if (a.order !== b.order) return a.order - b.order
+        return (a.createdAt || 0) - (b.createdAt || 0)
+      })
   }
-  return channels.map((channel) => ({ ...channel, type: channel.type === 'voice' ? 'voice' : 'text' }))
+  return channels
+    .map((channel, index) => ({
+      ...channel,
+      order: Number.isFinite(channel.order) ? channel.order : (Number.isFinite(channel.createdAt) ? channel.createdAt : index),
+      type: channel.type === 'voice' ? 'voice' : 'text',
+    }))
+    .sort((a, b) => {
+      if (a.order !== b.order) return a.order - b.order
+      return (a.createdAt || 0) - (b.createdAt || 0)
+    })
 }
 
 async function getChannelById(channelId) {
@@ -353,6 +372,7 @@ app.post('/api/channels', async (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return res.status(400).json({ error: 'name required' })
   const type = req.body?.type === 'voice' ? 'voice' : 'text'
+  const order = channelsCol ? await channelsCol.countDocuments() : channels.length
   const channel = {
     id: generateChannelId(),
     name,
@@ -360,6 +380,7 @@ app.post('/api/channels', async (req, res) => {
     hidden: false,
     createdAt: Date.now(),
     createdBy: userId,
+    order,
   }
   try {
     await upsertChannel(channel)
@@ -456,6 +477,53 @@ app.get('/api/history', async (req, res) => {
   const filtered = messageHistory.filter((message) => message.channelId === channelId)
   const start = Math.max(filtered.length - limit, 0)
   res.json(filtered.slice(start))
+})
+
+app.patch('/api/channels/order', async (req, res) => {
+  const userId = req.user?.id
+  if (!isAdminId(userId)) return res.status(403).json({ error: 'forbidden' })
+  const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map((id) => String(id)) : []
+  if (orderedIds.length === 0) return res.status(400).json({ error: 'orderedIds required' })
+  try {
+    if (channelsCol) {
+      const rows = await channelsCol.find({}, { projection: { _id: 0 } }).toArray()
+      const channelMap = new Map(rows.map((row) => [row.id, row]))
+      const used = new Set()
+      let order = 0
+      const updates = []
+      orderedIds.forEach((id) => {
+        if (!channelMap.has(id)) return
+        used.add(id)
+        updates.push({ id, order: order++ })
+      })
+      rows.forEach((row) => {
+        if (used.has(row.id)) return
+        updates.push({ id: row.id, order: order++ })
+      })
+      await Promise.all(updates.map((update) => channelsCol.updateOne({ id: update.id }, { $set: { order: update.order } })))
+    } else {
+      const channelMap = new Map(channels.map((channel) => [channel.id, channel]))
+      const used = new Set()
+      let order = 0
+      const ordered = []
+      orderedIds.forEach((id) => {
+        const channel = channelMap.get(id)
+        if (!channel) return
+        used.add(id)
+        ordered.push({ ...channel, order: order++ })
+      })
+      channels.forEach((channel) => {
+        if (used.has(channel.id)) return
+        ordered.push({ ...channel, order: order++ })
+      })
+      channels = ordered
+    }
+    io.emit('channels:update')
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[channels] order failed', e?.message || e)
+    res.status(500).json({ error: 'failed to reorder channels' })
+  }
 })
 
 app.post('/api/upload', upload.single('file'), async (req, res) => {
