@@ -19,15 +19,28 @@ const ORIGIN = process.env.WEB_ORIGIN || ''
 if (!ORIGIN) {
   console.warn('[WARN] WEB_ORIGIN is not set. Falling back to http://localhost:5173 for redirects.')
 }
+const corsOrigins = (process.env.CORS_ORIGINS || ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
+const allowNullOrigin = corsOrigins.includes('null')
+const corsOriginSet = new Set(corsOrigins)
+
+const corsOriginHandler = (origin, callback) => {
+  if (!origin) return callback(null, true)
+  if (origin === 'null' && allowNullOrigin) return callback(null, true)
+  if (corsOriginSet.has(origin)) return callback(null, true)
+  return callback(new Error(`Not allowed by CORS: ${origin}`))
+}
 const httpServer = createServer(app)
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: [process.env.WEB_ORIGIN || 'http://localhost:5173'],
+    origin: corsOriginHandler,
     credentials: true,
   },
 })
 
-app.use(cors({ origin: ORIGIN || 'http://localhost:5173', credentials: true }))
+app.use(cors({ origin: corsOriginHandler, credentials: true }))
 app.use(express.json())
 app.use(cookieParser())
 // trust proxy for correct secure cookies behind Fly/Proxies
