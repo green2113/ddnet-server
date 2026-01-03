@@ -10,6 +10,7 @@ import { Server as SocketIOServer } from 'socket.io'
 import { randomUUID } from 'crypto'
 import axios from 'axios'
 import { MongoClient } from 'mongodb'
+import bcrypt from 'bcryptjs'
 import multer from 'multer'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 
@@ -129,6 +130,8 @@ let mongoClient
 let messagesCol
 let channelsCol
 let adminsCol
+let usersCol
+const users = []
 async function initMongo() {
   const uri = process.env.MONGODB_URI
   if (!uri) return
@@ -141,6 +144,8 @@ async function initMongo() {
   await channelsCol.createIndex({ name: 1 }, { unique: true })
   adminsCol = db.collection(process.env.MONGO_ADMINS_COLL || 'admins')
   await adminsCol.createIndex({ id: 1 }, { unique: true })
+  usersCol = db.collection(process.env.MONGO_USERS_COLL || 'users')
+  await usersCol.createIndex({ email: 1 }, { unique: true })
   const existing = await channelsCol.countDocuments()
   if (existing === 0) {
     await channelsCol.insertMany(defaultChannels())
@@ -275,6 +280,12 @@ passport.use(
 
 app.use(passport.initialize())
 app.use(passport.session())
+app.use((req, _res, next) => {
+  if (!req.user && req.session?.localUser) {
+    req.user = req.session.localUser
+  }
+  next()
+})
 
 const sanitizeReturnTo = (value) => {
   if (typeof value !== 'string') return null
@@ -315,6 +326,88 @@ app.post('/auth/logout', (req, res) => {
       res.sendStatus(204)
     })
   })
+})
+
+const normalizeEmail = (value) => String(value || '').trim().toLowerCase()
+
+const toPublicUser = (user) => ({
+  id: user.id,
+  username: user.username,
+  displayName: user.displayName,
+  avatar: user.avatar || null,
+  email: user.email,
+  authType: user.authType || 'local',
+})
+
+const findUserByEmail = async (email) => {
+  if (usersCol) {
+    return usersCol.findOne({ email }, { projection: { _id: 0 } })
+  }
+  return users.find((user) => user.email === email) || null
+}
+
+const insertUser = async (user) => {
+  if (usersCol) {
+    await usersCol.insertOne(user)
+    return
+  }
+  users.push(user)
+}
+
+app.post('/auth/register', async (req, res) => {
+  const email = normalizeEmail(req.body?.email)
+  const password = String(req.body?.password || '')
+  const username = String(req.body?.username || '').trim()
+  if (!email || !password || !username) {
+    return res.status(400).json({ error: 'email, password, username required' })
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'password too short' })
+  }
+  const existing = await findUserByEmail(email)
+  if (existing) {
+    return res.status(409).json({ error: 'email already used' })
+  }
+  const passwordHash = await bcrypt.hash(password, 10)
+  const user = {
+    id: `local:${randomUUID()}`,
+    email,
+    username: username.slice(0, 32),
+    displayName: username.slice(0, 32),
+    avatar: null,
+    passwordHash,
+    createdAt: Date.now(),
+    authType: 'local',
+  }
+  try {
+    await insertUser(user)
+    req.session.localUser = toPublicUser(user)
+    if (req.session?.guestUser) delete req.session.guestUser
+    res.status(201).json(req.session.localUser)
+  } catch (e) {
+    console.error('[auth] register failed', e?.message || e)
+    res.status(500).json({ error: 'failed to register' })
+  }
+})
+
+app.post('/auth/login', async (req, res) => {
+  const email = normalizeEmail(req.body?.email)
+  const password = String(req.body?.password || '')
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password required' })
+  }
+  try {
+    const user = await findUserByEmail(email)
+    if (!user) return res.status(401).json({ error: 'invalid credentials' })
+    const ok = await bcrypt.compare(password, user.passwordHash || '')
+    if (!ok) return res.status(401).json({ error: 'invalid credentials' })
+    req.session.localUser = toPublicUser(user)
+    if (req.session?.guestUser) delete req.session.guestUser
+    res.json(req.session.localUser)
+  } catch (e) {
+    console.error('[auth] login failed', e?.message || e)
+    res.status(500).json({ error: 'failed to login' })
+  }
 })
 
 app.get('/api/me', (req, res) => {
