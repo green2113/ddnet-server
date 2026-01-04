@@ -68,7 +68,7 @@ let adminIds = [...DEFAULT_ADMIN_IDS]
 
 const isAdminId = (userId) => Boolean(userId) && adminIds.includes(userId)
 
-const generateChannelId = () => `${Date.now()}${Math.floor(Math.random() * 9000 + 1000)}`
+const generateChannelId = () => generateSnowflakeId()
 
 async function listChannels() {
   if (channelsCol) {
@@ -330,22 +330,34 @@ app.post('/auth/logout', (req, res) => {
 
 const normalizeEmail = (value) => String(value || '').trim().toLowerCase()
 
-const generateNumericUserId = async () => {
-  const makeId = () => `${Date.now()}${Math.floor(Math.random() * 900 + 100)}`
-  let nextId = makeId()
-  if (usersCol) {
-    // Retry a few times if collision happens (very unlikely).
-    for (let i = 0; i < 5; i += 1) {
-      const exists = await usersCol.findOne({ id: nextId }, { projection: { _id: 1 } })
-      if (!exists) return nextId
-      nextId = makeId()
+const SNOWFLAKE_EPOCH = BigInt(Number(process.env.SNOWFLAKE_EPOCH || 1704067200000)) // 2024-01-01
+const SNOWFLAKE_WORKER_ID = BigInt(Number(process.env.SNOWFLAKE_WORKER_ID || 1) & 0x3ff)
+const SNOWFLAKE_SEQUENCE_MASK = (1n << 12n) - 1n
+let snowflakeLastTs = 0n
+let snowflakeSeq = 0n
+
+const waitNextMs = (lastTs) => {
+  let now = BigInt(Date.now()) - SNOWFLAKE_EPOCH
+  while (now <= lastTs) {
+    now = BigInt(Date.now()) - SNOWFLAKE_EPOCH
+  }
+  return now
+}
+
+const generateSnowflakeId = () => {
+  let ts = BigInt(Date.now()) - SNOWFLAKE_EPOCH
+  if (ts < 0n) ts = 0n
+  if (ts === snowflakeLastTs) {
+    snowflakeSeq = (snowflakeSeq + 1n) & SNOWFLAKE_SEQUENCE_MASK
+    if (snowflakeSeq === 0n) {
+      ts = waitNextMs(snowflakeLastTs)
     }
-    return nextId
+  } else {
+    snowflakeSeq = 0n
   }
-  while (users.some((user) => user.id === nextId)) {
-    nextId = makeId()
-  }
-  return nextId
+  snowflakeLastTs = ts
+  const id = (ts << 22n) | (SNOWFLAKE_WORKER_ID << 12n) | snowflakeSeq
+  return id.toString()
 }
 
 const toPublicUser = (user) => ({
@@ -388,7 +400,7 @@ app.post('/auth/register', async (req, res) => {
   }
   const passwordHash = await bcrypt.hash(password, 10)
   const user = {
-    id: await generateNumericUserId(),
+    id: generateSnowflakeId(),
     email,
     username: username.slice(0, 32),
     displayName: username.slice(0, 32),
@@ -740,7 +752,7 @@ io.on('connection', (socket) => {
     if (!channel) return
     if (channel.hidden && !isAdminId(sessUser?.id)) return
     const message = {
-      id: randomUUID(),
+      id: generateSnowflakeId(),
       author: {
         id: sessUser?.id || 'web',
         username: sessUser?.username || 'WebUser',
@@ -965,7 +977,7 @@ app.post('/bridge/ddnet/incoming', (req, res) => {
   const { content, author, timestamp } = req.body || {}
   if (!content || typeof content !== 'string') return res.status(400).json({ error: 'content required' })
   const bridged = {
-    id: randomUUID(),
+    id: generateSnowflakeId(),
     author: { id: 'ddnet', username: author || 'DDNet' },
     content,
     channelId: 'ddnet-bridge',
