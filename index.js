@@ -58,21 +58,139 @@ app.set('trust proxy', 1)
 const MESSAGE_HISTORY_LIMIT = Number(process.env.MESSAGE_HISTORY_LIMIT || 500)
 const messageHistory = []
 
-const defaultChannels = () => [
-  { id: '1000', name: 'general', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system', order: 0 },
-  { id: '1001', name: 'ddnet-bridge', type: 'text', hidden: false, createdAt: Date.now(), createdBy: 'system', order: 1 },
+const DEFAULT_SERVER_NAME = process.env.DEFAULT_SERVER_NAME || 'Server'
+let defaultServerId = null
+
+const createDefaultChannels = (serverId, createdBy) => [
+  { id: generateSnowflakeId(), serverId, name: 'general', type: 'text', hidden: false, createdAt: Date.now(), createdBy, order: 0 },
+  { id: generateSnowflakeId(), serverId, name: 'voice', type: 'voice', hidden: false, createdAt: Date.now(), createdBy, order: 1 },
 ]
 
-let channels = defaultChannels()
-let adminIds = [...DEFAULT_ADMIN_IDS]
+let servers = []
+let memberships = []
+let invites = []
+let channels = []
 
-const isAdminId = (userId) => Boolean(userId) && adminIds.includes(userId)
+const isServerMember = async (userId, serverId) => {
+  if (!userId || !serverId) return false
+  if (membershipsCol) {
+    const row = await membershipsCol.findOne({ userId, serverId }, { projection: { _id: 0 } })
+    return !!row
+  }
+  return memberships.some((m) => m.userId === userId && m.serverId === serverId)
+}
 
-const generateChannelId = () => generateSnowflakeId()
+const getMembership = async (userId, serverId) => {
+  if (!userId || !serverId) return null
+  if (membershipsCol) {
+    return membershipsCol.findOne({ userId, serverId }, { projection: { _id: 0 } })
+  }
+  return memberships.find((m) => m.userId === userId && m.serverId === serverId) || null
+}
 
-async function listChannels() {
+const addMembership = async ({ userId, serverId, role }) => {
+  const row = { userId, serverId, role, joinedAt: Date.now() }
+  if (membershipsCol) {
+    await membershipsCol.updateOne({ userId, serverId }, { $set: row }, { upsert: true })
+    return
+  }
+  const idx = memberships.findIndex((m) => m.userId === userId && m.serverId === serverId)
+  if (idx >= 0) {
+    memberships[idx] = row
+  } else {
+    memberships.push(row)
+  }
+}
+
+const listServersForUser = async (userId) => {
+  if (!userId) return []
+  if (membershipsCol) {
+    const rows = await membershipsCol.find({ userId }, { projection: { _id: 0 } }).toArray()
+    if (rows.length === 0 && defaultServerId) {
+      await addMembership({ userId, serverId: defaultServerId, role: 'member' })
+      return listServersForUser(userId)
+    }
+    const ids = rows.map((row) => row.serverId)
+    if (!ids.length) return []
+    return serversCol.find({ id: { $in: ids } }, { projection: { _id: 0 } }).toArray()
+  }
+  const joined = memberships.filter((m) => m.userId === userId).map((m) => m.serverId)
+  if (!joined.length && defaultServerId) {
+    memberships.push({ userId, serverId: defaultServerId, role: 'member', joinedAt: Date.now() })
+    return listServersForUser(userId)
+  }
+  return servers.filter((server) => joined.includes(server.id))
+}
+
+const isServerAdmin = async (userId, serverId) => {
+  const membership = await getMembership(userId, serverId)
+  if (!membership) return false
+  return membership.role === 'owner' || membership.role === 'admin'
+}
+
+const isServerOwner = async (userId, serverId) => {
+  const membership = await getMembership(userId, serverId)
+  if (!membership) return false
+  return membership.role === 'owner'
+}
+
+const listAdmins = async (serverId) => {
+  if (!serverId) return []
+  if (membershipsCol) {
+    const rows = await membershipsCol
+      .find({ serverId, role: { $in: ['owner', 'admin'] } }, { projection: { _id: 0 } })
+      .toArray()
+    return rows.map((row) => row.userId)
+  }
+  return memberships.filter((m) => m.serverId === serverId && (m.role === 'owner' || m.role === 'admin')).map((m) => m.userId)
+}
+
+const getServerById = async (serverId) => {
+  if (!serverId) return null
+  if (serversCol) {
+    return serversCol.findOne({ id: serverId }, { projection: { _id: 0 } })
+  }
+  return servers.find((server) => server.id === serverId) || null
+}
+
+const insertServer = async (server) => {
+  if (serversCol) {
+    await serversCol.insertOne(server)
+    return
+  }
+  servers.push(server)
+}
+
+const INVITE_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const INVITE_CODE_LENGTH = 6
+
+const generateInviteCode = () => {
+  let code = ''
+  for (let i = 0; i < INVITE_CODE_LENGTH; i += 1) {
+    code += INVITE_CODE_ALPHABET[Math.floor(Math.random() * INVITE_CODE_ALPHABET.length)]
+  }
+  return code
+}
+
+const getInviteByCode = async (code) => {
+  if (!code) return null
+  if (invitesCol) {
+    return invitesCol.findOne({ code }, { projection: { _id: 0 } })
+  }
+  return invites.find((invite) => invite.code === code) || null
+}
+
+const insertInvite = async (invite) => {
+  if (invitesCol) {
+    await invitesCol.insertOne(invite)
+    return
+  }
+  invites.push(invite)
+}
+
+async function listChannels(serverId) {
   if (channelsCol) {
-    const rows = await channelsCol.find({}, { projection: { _id: 0 } }).toArray()
+    const rows = await channelsCol.find(serverId ? { serverId } : {}, { projection: { _id: 0 } }).toArray()
     return rows
       .map((row, index) => ({
         ...row,
@@ -86,6 +204,7 @@ async function listChannels() {
       })
   }
   return channels
+    .filter((channel) => (serverId ? channel.serverId === serverId : true))
     .map((channel, index) => ({
       ...channel,
       order: Number.isFinite(channel.order) ? channel.order : (Number.isFinite(channel.createdAt) ? channel.createdAt : index),
@@ -129,7 +248,9 @@ async function removeChannel(channelId) {
 let mongoClient
 let messagesCol
 let channelsCol
-let adminsCol
+let serversCol
+let membershipsCol
+let invitesCol
 let usersCol
 const users = []
 async function initMongo() {
@@ -141,48 +262,50 @@ async function initMongo() {
   messagesCol = db.collection(process.env.MONGO_COLL || 'messages')
   await messagesCol.createIndex({ ts: 1 })
   channelsCol = db.collection(process.env.MONGO_CHANNELS_COLL || 'channels')
-  await channelsCol.createIndex({ name: 1 }, { unique: true })
-  adminsCol = db.collection(process.env.MONGO_ADMINS_COLL || 'admins')
-  await adminsCol.createIndex({ id: 1 }, { unique: true })
+  try {
+    const indexes = await channelsCol.indexes()
+    const legacy = indexes.find((idx) => idx?.name === 'name_1')
+    if (legacy) {
+      await channelsCol.dropIndex(legacy.name)
+    }
+  } catch (e) {
+    console.warn('[mongo] channels index cleanup skipped', e?.message || e)
+  }
+  await channelsCol.createIndex({ serverId: 1, name: 1 }, { unique: true })
+  serversCol = db.collection(process.env.MONGO_SERVERS_COLL || 'servers')
+  await serversCol.createIndex({ id: 1 }, { unique: true })
+  membershipsCol = db.collection(process.env.MONGO_MEMBERSHIPS_COLL || 'memberships')
+  await membershipsCol.createIndex({ serverId: 1, userId: 1 }, { unique: true })
+  invitesCol = db.collection(process.env.MONGO_INVITES_COLL || 'invites')
+  await invitesCol.createIndex({ code: 1 }, { unique: true })
   usersCol = db.collection(process.env.MONGO_USERS_COLL || 'users')
   await usersCol.createIndex({ email: 1 }, { unique: true })
-  const existing = await channelsCol.countDocuments()
-  if (existing === 0) {
-    await channelsCol.insertMany(defaultChannels())
+  const serverCount = await serversCol.countDocuments()
+  if (serverCount === 0) {
+    const ownerId = DEFAULT_ADMIN_IDS[0] || 'system'
+    const server = { id: generateSnowflakeId(), name: DEFAULT_SERVER_NAME, ownerId, createdAt: Date.now() }
+    await serversCol.insertOne(server)
+    defaultServerId = server.id
+    const defaultChannels = createDefaultChannels(server.id, ownerId)
+    await channelsCol.insertMany(defaultChannels)
+    await membershipsCol.insertOne({ userId: ownerId, serverId: server.id, role: 'owner', joinedAt: Date.now() })
+  } else {
+    const first = await serversCol.find({}, { projection: { _id: 0 } }).sort({ createdAt: 1 }).limit(1).toArray()
+    defaultServerId = first[0]?.id || null
   }
-  const adminCount = await adminsCol.countDocuments()
-  if (adminCount === 0) {
-    await adminsCol.insertMany(DEFAULT_ADMIN_IDS.map((id) => ({ id })))
+  if (defaultServerId) {
+    await channelsCol.updateMany({ serverId: { $exists: false } }, { $set: { serverId: defaultServerId } })
   }
   console.log('[mongo] connected')
 }
 initMongo().catch((e) => console.error('[mongo] init failed', e?.message || e))
-
-async function listAdmins() {
-  if (adminsCol) {
-    const rows = await adminsCol.find({}, { projection: { _id: 0 } }).toArray()
-    adminIds = rows.map((row) => row.id)
-    return adminIds
-  }
-  return adminIds
-}
-
-async function addAdmin(id) {
-  if (adminsCol) {
-    await adminsCol.updateOne({ id }, { $set: { id } }, { upsert: true })
-  } else if (!adminIds.includes(id)) {
-    adminIds.push(id)
-  }
-  return listAdmins()
-}
-
-async function removeAdmin(id) {
-  if (adminsCol) {
-    await adminsCol.deleteOne({ id })
-  } else {
-    adminIds = adminIds.filter((existing) => existing !== id)
-  }
-  return listAdmins()
+if (!process.env.MONGODB_URI) {
+  const ownerId = DEFAULT_ADMIN_IDS[0] || 'system'
+  const server = { id: generateSnowflakeId(), name: DEFAULT_SERVER_NAME, ownerId, createdAt: Date.now() }
+  servers = [server]
+  defaultServerId = server.id
+  channels = createDefaultChannels(server.id, ownerId)
+  memberships = [{ userId: ownerId, serverId: server.id, role: 'owner', joinedAt: Date.now() }]
 }
 
 const isHttps = (ORIGIN || '').startsWith('https://')
@@ -462,9 +585,63 @@ app.post('/auth/guest', (req, res) => {
   res.status(201).json(guestUser)
 })
 
-app.get('/api/admins', async (req, res) => {
+app.get('/api/servers', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
   try {
-    const admins = await listAdmins()
+    const list = await listServersForUser(user.id)
+    res.json(list)
+  } catch (e) {
+    console.error('[servers] list failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load servers' })
+  }
+})
+
+app.post('/api/servers', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const name = String(req.body?.name || '').trim()
+  if (!name) return res.status(400).json({ error: 'name required' })
+  const server = {
+    id: generateSnowflakeId(),
+    name: name.slice(0, 64),
+    ownerId: user.id,
+    createdAt: Date.now(),
+  }
+  try {
+    await insertServer(server)
+    await addMembership({ userId: user.id, serverId: server.id, role: 'owner' })
+    const defaultChannels = createDefaultChannels(server.id, user.id)
+    await Promise.all(defaultChannels.map((channel) => upsertChannel(channel)))
+    io.emit('servers:update')
+    res.status(201).json(server)
+  } catch (e) {
+    console.error('[servers] create failed', e?.message || e)
+    res.status(500).json({ error: 'failed to create server' })
+  }
+})
+
+app.get('/api/servers/:serverId', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  const member = await isServerMember(user.id, serverId)
+  if (!member) return res.status(403).json({ error: 'forbidden' })
+  const server = await getServerById(serverId)
+  if (!server) return res.status(404).json({ error: 'server not found' })
+  res.json(server)
+})
+
+app.get('/api/servers/:serverId/admins', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  const member = await isServerMember(user.id, serverId)
+  if (!member) return res.status(403).json({ error: 'forbidden' })
+  try {
+    const admins = await listAdmins(serverId)
     res.json(admins)
   } catch (e) {
     console.error('[admins] list failed', e?.message || e)
@@ -472,12 +649,19 @@ app.get('/api/admins', async (req, res) => {
   }
 })
 
-app.post('/api/admins', async (req, res) => {
-  if (!isAdminId(req.user?.id)) return res.status(403).json({ error: 'forbidden' })
+app.post('/api/servers/:serverId/admins', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerOwner(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
   const id = String(req.body?.id || '').trim()
   if (!id) return res.status(400).json({ error: 'id required' })
+  const server = await getServerById(serverId)
+  if (!server) return res.status(404).json({ error: 'server not found' })
   try {
-    const admins = await addAdmin(id)
+    await addMembership({ userId: id, serverId, role: 'admin' })
+    const admins = await listAdmins(serverId)
     res.status(201).json(admins)
   } catch (e) {
     console.error('[admins] add failed', e?.message || e)
@@ -485,12 +669,21 @@ app.post('/api/admins', async (req, res) => {
   }
 })
 
-app.delete('/api/admins/:id', async (req, res) => {
-  if (!isAdminId(req.user?.id)) return res.status(403).json({ error: 'forbidden' })
+app.delete('/api/servers/:serverId/admins/:id', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerOwner(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
   const id = String(req.params.id || '').trim()
   if (!id) return res.status(400).json({ error: 'id required' })
+  if (id === user.id) return res.status(400).json({ error: 'cannot remove owner' })
   try {
-    const admins = await removeAdmin(id)
+    const existing = await getMembership(id, serverId)
+    if (!existing) return res.status(404).json({ error: 'member not found' })
+    const role = existing.role === 'owner' ? 'owner' : 'member'
+    await addMembership({ userId: id, serverId, role })
+    const admins = await listAdmins(serverId)
     res.json(admins)
   } catch (e) {
     console.error('[admins] remove failed', e?.message || e)
@@ -498,11 +691,17 @@ app.delete('/api/admins/:id', async (req, res) => {
   }
 })
 
-app.get('/api/channels', async (req, res) => {
+app.get('/api/servers/:serverId/channels', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  const member = await isServerMember(user.id, serverId)
+  if (!member) return res.status(403).json({ error: 'forbidden' })
   try {
-    const userId = req.user?.id
-    const allChannels = await listChannels()
-    const visible = isAdminId(userId) ? allChannels : allChannels.filter((channel) => !channel.hidden)
+    const allChannels = await listChannels(serverId)
+    const isAdmin = await isServerAdmin(user.id, serverId)
+    const visible = isAdmin ? allChannels : allChannels.filter((channel) => !channel.hidden)
     res.json(visible)
   } catch (e) {
     console.error('[channels] list failed', e?.message || e)
@@ -510,25 +709,31 @@ app.get('/api/channels', async (req, res) => {
   }
 })
 
-app.post('/api/channels', async (req, res) => {
-  const userId = req.user?.id
-  if (!isAdminId(userId)) return res.status(403).json({ error: 'forbidden' })
+app.post('/api/servers/:serverId/channels', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
   const name = String(req.body?.name || '').trim()
   if (!name) return res.status(400).json({ error: 'name required' })
   const type = req.body?.type === 'voice' ? 'voice' : 'text'
-  const order = channelsCol ? await channelsCol.countDocuments() : channels.length
+  const order = channelsCol
+    ? await channelsCol.countDocuments({ serverId })
+    : channels.filter((channel) => channel.serverId === serverId).length
   const channel = {
-    id: generateChannelId(),
+    id: generateSnowflakeId(),
+    serverId,
     name,
     type,
     hidden: false,
     createdAt: Date.now(),
-    createdBy: userId,
+    createdBy: user.id,
     order,
   }
   try {
     await upsertChannel(channel)
-    io.emit('channels:update')
+    io.emit('channels:update', { serverId })
     res.status(201).json(channel)
   } catch (e) {
     console.error('[channels] create failed', e?.message || e)
@@ -536,11 +741,16 @@ app.post('/api/channels', async (req, res) => {
   }
 })
 
-app.delete('/api/channels/:id', async (req, res) => {
-  const userId = req.user?.id
-  if (!isAdminId(userId)) return res.status(403).json({ error: 'forbidden' })
+app.delete('/api/servers/:serverId/channels/:id', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
   const channelId = req.params.id
   try {
+    const channel = await getChannelById(channelId)
+    if (!channel || channel.serverId !== serverId) return res.status(404).json({ error: 'channel not found' })
     await removeChannel(channelId)
     if (messagesCol) {
       await messagesCol.deleteMany({ channelId })
@@ -550,7 +760,7 @@ app.delete('/api/channels/:id', async (req, res) => {
         if (messageHistory[idx].channelId === channelId) messageHistory.splice(idx, 1)
       }
     }
-    io.emit('channels:update')
+    io.emit('channels:update', { serverId })
     res.sendStatus(204)
   } catch (e) {
     console.error('[channels] delete failed', e?.message || e)
@@ -558,22 +768,162 @@ app.delete('/api/channels/:id', async (req, res) => {
   }
 })
 
-app.patch('/api/channels/:id/hidden', async (req, res) => {
-  const userId = req.user?.id
-  if (!isAdminId(userId)) return res.status(403).json({ error: 'forbidden' })
+app.patch('/api/servers/:serverId/channels/:id/hidden', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
   const channelId = req.params.id
   const hidden = Boolean(req.body?.hidden)
   try {
     const channel = await getChannelById(channelId)
-    if (!channel) return res.status(404).json({ error: 'channel not found' })
+    if (!channel || channel.serverId !== serverId) return res.status(404).json({ error: 'channel not found' })
     const updated = { ...channel, hidden }
     await upsertChannel(updated)
-    io.emit('channels:update')
+    io.emit('channels:update', { serverId })
     res.json(updated)
   } catch (e) {
     console.error('[channels] hide failed', e?.message || e)
     res.status(500).json({ error: 'failed to update channel' })
   }
+})
+
+app.patch('/api/servers/:serverId/channels/:id/name', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  const channelId = req.params.id
+  const name = String(req.body?.name || '').trim()
+  if (!name) return res.status(400).json({ error: 'name required' })
+  try {
+    const channel = await getChannelById(channelId)
+    if (!channel || channel.serverId !== serverId) return res.status(404).json({ error: 'channel not found' })
+    const updated = { ...channel, name: name.slice(0, 64) }
+    await upsertChannel(updated)
+    io.emit('channels:update', { serverId })
+    res.json(updated)
+  } catch (e) {
+    console.error('[channels] rename failed', e?.message || e)
+    res.status(500).json({ error: 'failed to rename channel' })
+  }
+})
+
+app.patch('/api/servers/:serverId/channels/order', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map((id) => String(id)) : []
+  if (orderedIds.length === 0) return res.status(400).json({ error: 'orderedIds required' })
+  try {
+    if (channelsCol) {
+      const rows = await channelsCol.find({ serverId }, { projection: { _id: 0 } }).toArray()
+      const channelMap = new Map(rows.map((row) => [row.id, row]))
+      const used = new Set()
+      let order = 0
+      const updates = []
+      orderedIds.forEach((id) => {
+        if (!channelMap.has(id)) return
+        used.add(id)
+        updates.push({ id, order: order++ })
+      })
+      rows.forEach((row) => {
+        if (used.has(row.id)) return
+        updates.push({ id: row.id, order: order++ })
+      })
+      await Promise.all(updates.map((update) => channelsCol.updateOne({ id: update.id }, { $set: { order: update.order } })))
+    } else {
+      const serverChannels = channels.filter((channel) => channel.serverId === serverId)
+      const channelMap = new Map(serverChannels.map((channel) => [channel.id, channel]))
+      const used = new Set()
+      let order = 0
+      const ordered = []
+      orderedIds.forEach((id) => {
+        const channel = channelMap.get(id)
+        if (!channel) return
+        used.add(id)
+        ordered.push({ ...channel, order: order++ })
+      })
+      serverChannels.forEach((channel) => {
+        if (used.has(channel.id)) return
+        ordered.push({ ...channel, order: order++ })
+      })
+      channels = channels.map((channel) => {
+        const next = ordered.find((item) => item.id === channel.id)
+        return next || channel
+      })
+    }
+    io.emit('channels:update', { serverId })
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[channels] order failed', e?.message || e)
+    res.status(500).json({ error: 'failed to reorder channels' })
+  }
+})
+
+app.post('/api/servers/:serverId/invites', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  const member = await isServerMember(user.id, serverId)
+  if (!member) return res.status(403).json({ error: 'forbidden' })
+  const server = await getServerById(serverId)
+  if (!server) return res.status(404).json({ error: 'server not found' })
+  let code = null
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const next = generateInviteCode()
+    const exists = await getInviteByCode(next)
+    if (!exists) {
+      code = next
+      break
+    }
+  }
+  if (!code) return res.status(500).json({ error: 'failed to generate invite' })
+  const invite = {
+    code,
+    serverId,
+    createdBy: user.id,
+    createdAt: Date.now(),
+  }
+  try {
+    await insertInvite(invite)
+    const base = (ORIGIN || '').replace(/\/$/, '')
+    res.status(201).json({ ...invite, url: base ? `${base}/invite/${code}` : `/invite/${code}` })
+  } catch (e) {
+    console.error('[invites] create failed', e?.message || e)
+    res.status(500).json({ error: 'failed to create invite' })
+  }
+})
+
+app.get('/api/invite/:code', async (req, res) => {
+  const code = String(req.params.code || '').trim()
+  if (!code) return res.status(400).json({ error: 'code required' })
+  const invite = await getInviteByCode(code)
+  if (!invite) return res.status(404).json({ error: 'invite not found' })
+  const server = await getServerById(invite.serverId)
+  if (!server) return res.status(404).json({ error: 'server not found' })
+  res.json({ code: invite.code, server: { id: server.id, name: server.name, ownerId: server.ownerId } })
+})
+
+app.post('/api/invite/:code/join', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const code = String(req.params.code || '').trim()
+  if (!code) return res.status(400).json({ error: 'code required' })
+  const invite = await getInviteByCode(code)
+  if (!invite) return res.status(404).json({ error: 'invite not found' })
+  const server = await getServerById(invite.serverId)
+  if (!server) return res.status(404).json({ error: 'server not found' })
+  const member = await isServerMember(user.id, server.id)
+  if (!member) {
+    await addMembership({ userId: user.id, serverId: server.id, role: 'member' })
+  }
+  res.json({ server })
 })
 
 // Normalize stored rows (both legacy flat docs and new nested docs) to message shape
@@ -603,8 +953,14 @@ function normalizeMessageRow(row) {
 }
 
 app.get('/api/history', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
   const limit = Math.min(Number(req.query.limit) || 200, MESSAGE_HISTORY_LIMIT)
   const channelId = String(req.query.channelId || 'general')
+  const channel = await getChannelById(channelId)
+  if (!channel) return res.status(404).json({ error: 'channel not found' })
+  const member = await isServerMember(user.id, channel.serverId)
+  if (!member) return res.status(403).json({ error: 'forbidden' })
   if (messagesCol) {
     try {
       const rows = await messagesCol
@@ -623,56 +979,10 @@ app.get('/api/history', async (req, res) => {
   res.json(filtered.slice(start))
 })
 
-app.patch('/api/channels/order', async (req, res) => {
-  const userId = req.user?.id
-  if (!isAdminId(userId)) return res.status(403).json({ error: 'forbidden' })
-  const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map((id) => String(id)) : []
-  if (orderedIds.length === 0) return res.status(400).json({ error: 'orderedIds required' })
-  try {
-    if (channelsCol) {
-      const rows = await channelsCol.find({}, { projection: { _id: 0 } }).toArray()
-      const channelMap = new Map(rows.map((row) => [row.id, row]))
-      const used = new Set()
-      let order = 0
-      const updates = []
-      orderedIds.forEach((id) => {
-        if (!channelMap.has(id)) return
-        used.add(id)
-        updates.push({ id, order: order++ })
-      })
-      rows.forEach((row) => {
-        if (used.has(row.id)) return
-        updates.push({ id: row.id, order: order++ })
-      })
-      await Promise.all(updates.map((update) => channelsCol.updateOne({ id: update.id }, { $set: { order: update.order } })))
-    } else {
-      const channelMap = new Map(channels.map((channel) => [channel.id, channel]))
-      const used = new Set()
-      let order = 0
-      const ordered = []
-      orderedIds.forEach((id) => {
-        const channel = channelMap.get(id)
-        if (!channel) return
-        used.add(id)
-        ordered.push({ ...channel, order: order++ })
-      })
-      channels.forEach((channel) => {
-        if (used.has(channel.id)) return
-        ordered.push({ ...channel, order: order++ })
-      })
-      channels = ordered
-    }
-    io.emit('channels:update')
-    res.json({ ok: true })
-  } catch (e) {
-    console.error('[channels] order failed', e?.message || e)
-    res.status(500).json({ error: 'failed to reorder channels' })
-  }
-})
 
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   const user = getSessionUser(req)
-  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
   if (!r2Client || !R2_BUCKET || !R2_PUBLIC_BASE_URL) {
     return res.status(500).json({ error: 'upload not configured' })
   }
@@ -680,6 +990,8 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!channelId) return res.status(400).json({ error: 'channelId required' })
   const channel = await getChannelById(channelId)
   if (!channel) return res.status(404).json({ error: 'channel not found' })
+  const member = await isServerMember(user.id, channel.serverId)
+  if (!member) return res.status(403).json({ error: 'forbidden' })
   const file = req.file
   if (!file) return res.status(400).json({ error: 'file required' })
   if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
@@ -733,6 +1045,10 @@ io.on('connection', (socket) => {
     if (!channelId) return
     const channel = await getChannelById(channelId)
     if (!channel || channel.type !== 'voice') return
+    const sessUser = resolveSessionUser()
+    if (!sessUser) return
+    const member = await isServerMember(sessUser.id, channel.serverId)
+    if (!member) return
     socket.join(`voice:watch:${channelId}`)
     emitVoiceMembers(channelId)
   })
@@ -751,7 +1067,9 @@ io.on('connection', (socket) => {
     const channelId = typeof payload?.channelId === 'string' ? payload.channelId : 'general'
     const channel = await getChannelById(channelId)
     if (!channel) return
-    if (channel.hidden && !isAdminId(sessUser?.id)) return
+    const member = await isServerMember(sessUser.id, channel.serverId)
+    if (!member) return
+    if (channel.hidden && !await isServerAdmin(sessUser?.id, channel.serverId)) return
     const message = {
       id: generateSnowflakeId(),
       author: {
@@ -804,20 +1122,27 @@ io.on('connection', (socket) => {
       if (!messageId) return
       const sessUser = resolveSessionUser()
       if (!sessUser) return
-      const canDeleteAny = isAdminId(sessUser.id)
-
       let deleted = false
+      let target = null
       if (messagesCol) {
-        // Find the message to verify ownership
-        const found = await messagesCol.findOne({ id: messageId }, { projection: { author: 1, user_id: 1 } })
-        const authorId = found?.author?.id || found?.user_id
-        if (authorId && (authorId === sessUser.id || canDeleteAny)) {
-          const r = await messagesCol.deleteOne({ id: messageId })
-          deleted = r.deletedCount > 0
-        }
+        target = await messagesCol.findOne({ id: messageId }, { projection: { author: 1, user_id: 1, channelId: 1 } })
+      } else {
+        target = messageHistory.find((m) => m.id === messageId) || null
+      }
+      if (!target?.channelId) return
+      const channel = await getChannelById(target.channelId)
+      if (!channel) return
+      const member = await isServerMember(sessUser.id, channel.serverId)
+      if (!member) return
+      const canDeleteAny = await isServerAdmin(sessUser.id, channel.serverId)
+      const authorId = target?.author?.id || target?.user_id
+      if (!authorId || (authorId !== sessUser.id && !canDeleteAny)) return
+      if (messagesCol) {
+        const r = await messagesCol.deleteOne({ id: messageId })
+        deleted = r.deletedCount > 0
       } else {
         const idx = messageHistory.findIndex((m) => m.id === messageId)
-        if (idx >= 0 && (messageHistory[idx].author?.id === sessUser.id || canDeleteAny)) {
+        if (idx >= 0) {
           messageHistory.splice(idx, 1)
           deleted = true
         }
@@ -838,6 +1163,8 @@ io.on('connection', (socket) => {
     if (!channelId) return
     const channel = await getChannelById(channelId)
     if (!channel || channel.type !== 'voice') return
+    const member = await isServerMember(sessUser.id, channel.serverId)
+    if (!member) return
     voiceMembers.forEach((members, existingChannelId) => {
       if (existingChannelId === channelId) return
       if (!members.has(socket.id)) return
