@@ -162,12 +162,14 @@ const insertServer = async (server) => {
   servers.push(server)
 }
 
-const INVITE_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-const INVITE_CODE_LENGTH = 6
+const INVITE_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+const INVITE_CODE_MIN = 7
+const INVITE_CODE_MAX = 9
 
 const generateInviteCode = () => {
+  const length = INVITE_CODE_MIN + Math.floor(Math.random() * (INVITE_CODE_MAX - INVITE_CODE_MIN + 1))
   let code = ''
-  for (let i = 0; i < INVITE_CODE_LENGTH; i += 1) {
+  for (let i = 0; i < length; i += 1) {
     code += INVITE_CODE_ALPHABET[Math.floor(Math.random() * INVITE_CODE_ALPHABET.length)]
   }
   return code
@@ -187,6 +189,14 @@ const insertInvite = async (invite) => {
     return
   }
   invites.push(invite)
+}
+
+const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+const isInviteExpired = (invite) => {
+  if (!invite) return true
+  if (!invite.expiresAt) return false
+  return Date.now() > Number(invite.expiresAt)
 }
 
 async function listChannels(serverId) {
@@ -930,6 +940,7 @@ app.post('/api/servers/:serverId/invites', async (req, res) => {
     serverId,
     createdBy: user.id,
     createdAt: Date.now(),
+    expiresAt: Date.now() + INVITE_TTL_MS,
   }
   try {
     await insertInvite(invite)
@@ -946,6 +957,7 @@ app.get('/api/invite/:code', async (req, res) => {
   if (!code) return res.status(400).json({ error: 'code required' })
   const invite = await getInviteByCode(code)
   if (!invite) return res.status(404).json({ error: 'invite not found' })
+  if (isInviteExpired(invite)) return res.status(410).json({ error: 'invite expired' })
   const server = await getServerById(invite.serverId)
   if (!server) return res.status(404).json({ error: 'server not found' })
   res.json({ code: invite.code, server: { id: server.id, name: server.name, ownerId: server.ownerId } })
@@ -958,6 +970,7 @@ app.post('/api/invite/:code/join', async (req, res) => {
   if (!code) return res.status(400).json({ error: 'code required' })
   const invite = await getInviteByCode(code)
   if (!invite) return res.status(404).json({ error: 'invite not found' })
+  if (isInviteExpired(invite)) return res.status(410).json({ error: 'invite expired' })
   const server = await getServerById(invite.serverId)
   if (!server) return res.status(404).json({ error: 'server not found' })
   const member = await isServerMember(user.id, server.id)
