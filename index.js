@@ -70,6 +70,7 @@ let servers = []
 let memberships = []
 let invites = []
 let channels = []
+let serverOrders = new Map()
 
 const isServerMember = async (userId, serverId) => {
   if (!userId || !serverId) return false
@@ -252,6 +253,7 @@ let serversCol
 let membershipsCol
 let invitesCol
 let usersCol
+let serverOrdersCol
 const users = []
 async function initMongo() {
   const uri = process.env.MONGODB_URI
@@ -280,6 +282,8 @@ async function initMongo() {
   await invitesCol.createIndex({ code: 1 }, { unique: true })
   usersCol = db.collection(process.env.MONGO_USERS_COLL || 'users')
   await usersCol.createIndex({ email: 1 }, { unique: true })
+  serverOrdersCol = db.collection(process.env.MONGO_SERVER_ORDERS_COLL || 'server_orders')
+  await serverOrdersCol.createIndex({ userId: 1 }, { unique: true })
   const serverCount = await serversCol.countDocuments()
   if (serverCount === 0) {
     const ownerId = DEFAULT_ADMIN_IDS[0] || 'system'
@@ -631,6 +635,43 @@ app.get('/api/servers/:serverId', async (req, res) => {
   const server = await getServerById(serverId)
   if (!server) return res.status(404).json({ error: 'server not found' })
   res.json(server)
+})
+
+app.get('/api/servers/order', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  try {
+    if (serverOrdersCol) {
+      const row = await serverOrdersCol.findOne({ userId: user.id }, { projection: { _id: 0 } })
+      return res.json(Array.isArray(row?.order) ? row.order : [])
+    }
+    const order = serverOrders.get(user.id)
+    res.json(Array.isArray(order) ? order : [])
+  } catch (e) {
+    console.error('[servers] order load failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load server order' })
+  }
+})
+
+app.put('/api/servers/order', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map((id) => String(id)) : []
+  try {
+    if (serverOrdersCol) {
+      await serverOrdersCol.updateOne(
+        { userId: user.id },
+        { $set: { userId: user.id, order: orderedIds, updatedAt: Date.now() } },
+        { upsert: true }
+      )
+    } else {
+      serverOrders.set(user.id, orderedIds)
+    }
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[servers] order save failed', e?.message || e)
+    res.status(500).json({ error: 'failed to save server order' })
+  }
 })
 
 app.get('/api/servers/:serverId/admins', async (req, res) => {
