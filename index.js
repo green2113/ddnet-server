@@ -330,6 +330,24 @@ app.post('/auth/logout', (req, res) => {
 
 const normalizeEmail = (value) => String(value || '').trim().toLowerCase()
 
+const generateNumericUserId = async () => {
+  const makeId = () => `${Date.now()}${Math.floor(Math.random() * 900 + 100)}`
+  let nextId = makeId()
+  if (usersCol) {
+    // Retry a few times if collision happens (very unlikely).
+    for (let i = 0; i < 5; i += 1) {
+      const exists = await usersCol.findOne({ id: nextId }, { projection: { _id: 1 } })
+      if (!exists) return nextId
+      nextId = makeId()
+    }
+    return nextId
+  }
+  while (users.some((user) => user.id === nextId)) {
+    nextId = makeId()
+  }
+  return nextId
+}
+
 const toPublicUser = (user) => ({
   id: user.id,
   username: user.username,
@@ -370,7 +388,7 @@ app.post('/auth/register', async (req, res) => {
   }
   const passwordHash = await bcrypt.hash(password, 10)
   const user = {
-    id: `local:${randomUUID()}`,
+    id: await generateNumericUserId(),
     email,
     username: username.slice(0, 32),
     displayName: username.slice(0, 32),
