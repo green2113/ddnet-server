@@ -440,6 +440,7 @@ app.post('/auth/login', async (req, res) => {
   }
 })
 
+
 app.get('/api/me', (req, res) => {
   if (req.user) return res.json({ ...req.user, isGuest: false })
   if (req.session?.guestUser) return res.json(req.session.guestUser)
@@ -724,7 +725,7 @@ const emitVoiceMembers = (channelId) => {
 io.on('connection', (socket) => {
   const resolveSessionUser = () => {
     const sess = socket.request?.session
-    return sess?.passport?.user || sess?.guestUser
+    return sess?.passport?.user || sess?.localUser || sess?.guestUser
   }
 
   socket.on('voice:watch', async (payload) => {
