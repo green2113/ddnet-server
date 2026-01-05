@@ -1016,24 +1016,31 @@ app.patch('/api/servers/:serverId/channels/order', async (req, res) => {
     if (channelsCol) {
       const rows = await channelsCol.find({ serverId }, { projection: { _id: 0 } }).toArray()
       const targetRows = rows.filter((row) => row.type !== 'category' && (categoryId ? row.categoryId === categoryId : !row.categoryId))
-      const channelMap = new Map(targetRows.map((row) => [row.id, row]))
+      const channelMap = new Map(rows.filter((row) => row.type !== 'category').map((row) => [row.id, row]))
       const used = new Set()
       let order = 0
       const updates = []
       orderedIds.forEach((id) => {
         if (!channelMap.has(id)) return
         used.add(id)
-        updates.push({ id, order: order++ })
+        updates.push({ id, order: order++, categoryId: categoryId || null })
       })
       targetRows.forEach((row) => {
         if (used.has(row.id)) return
         updates.push({ id: row.id, order: order++ })
       })
-      await Promise.all(updates.map((update) => channelsCol.updateOne({ id: update.id }, { $set: { order: update.order } })))
+      await Promise.all(
+        updates.map((update) =>
+          channelsCol.updateOne(
+            { id: update.id },
+            { $set: { order: update.order, ...(update.categoryId !== undefined ? { categoryId: update.categoryId } : {}) } },
+          )
+        )
+      )
     } else {
       const serverChannels = channels.filter((channel) => channel.serverId === serverId)
       const targetChannels = serverChannels.filter((channel) => channel.type !== 'category' && (categoryId ? channel.categoryId === categoryId : !channel.categoryId))
-      const channelMap = new Map(targetChannels.map((channel) => [channel.id, channel]))
+      const channelMap = new Map(serverChannels.filter((channel) => channel.type !== 'category').map((channel) => [channel.id, channel]))
       const used = new Set()
       let order = 0
       const ordered = []
@@ -1041,7 +1048,7 @@ app.patch('/api/servers/:serverId/channels/order', async (req, res) => {
         const channel = channelMap.get(id)
         if (!channel) return
         used.add(id)
-        ordered.push({ ...channel, order: order++ })
+        ordered.push({ ...channel, order: order++, categoryId: categoryId || null })
       })
       targetChannels.forEach((channel) => {
         if (used.has(channel.id)) return
