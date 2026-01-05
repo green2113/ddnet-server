@@ -1462,7 +1462,7 @@ io.on('connection', (socket) => {
     if (!channelId) return
     const channel = await getChannelById(channelId)
     if (!channel || channel.type !== 'voice') return
-    const member = await isServerMember(sessUser.id, channel.serverId)
+    const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
     if (!member) return
     voiceMembers.forEach((members, existingChannelId) => {
       if (existingChannelId === channelId) return
