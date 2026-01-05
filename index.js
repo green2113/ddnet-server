@@ -519,7 +519,7 @@ app.post('/auth/logout', (req, res) => {
 
 const normalizeEmail = (value) => String(value || '').trim().toLowerCase()
 const normalizeHandle = (value) => String(value || '').trim().replace(/^@+/, '')
-const isValidHandle = (value) => /^[A-Za-z0-9_]{1,8}$/.test(value)
+const isValidHandle = (value) => /^[A-Za-z0-9_]{1,15}$/.test(value)
 
 const SNOWFLAKE_EPOCH = BigInt(Number(process.env.SNOWFLAKE_EPOCH || 1704067200000)) // 2024-01-01
 const SNOWFLAKE_WORKER_ID = BigInt(Number(process.env.SNOWFLAKE_WORKER_ID || 1) & 0x3ff)
