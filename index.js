@@ -125,6 +125,29 @@ const isServerMember = async (userId, serverId) => {
   return memberships.some((m) => m.userId === userId && m.serverId === serverId)
 }
 
+const getGuestServerIds = (session) => {
+  if (!session) return []
+  const list = session.guestServers
+  return Array.isArray(list) ? list.map((id) => String(id)) : []
+}
+
+const addGuestServer = (session, serverId) => {
+  if (!session || !serverId) return
+  const list = getGuestServerIds(session)
+  if (!list.includes(serverId)) {
+    list.push(serverId)
+    session.guestServers = list
+  }
+}
+
+const isSessionMember = async (user, serverId, session) => {
+  if (!user || !serverId) return false
+  if (user.isGuest) {
+    return getGuestServerIds(session).includes(serverId)
+  }
+  return isServerMember(user.id, serverId)
+}
+
 const getMembership = async (userId, serverId) => {
   if (!userId || !serverId) return null
   if (membershipsCol) {
@@ -617,7 +640,7 @@ app.post('/auth/register', async (req, res) => {
     id: generateSnowflakeId(),
     email,
     username: handle,
-    displayName: handle,
+    displayName: rawHandle,
     avatar: null,
     passwordHash,
     createdAt: Date.now(),
@@ -687,8 +710,13 @@ app.post('/auth/guest', (req, res) => {
 
 app.get('/api/servers', async (req, res) => {
   const user = getSessionUser(req)
-  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
   try {
+    if (user.isGuest) {
+      const ids = getGuestServerIds(req.session)
+      const rows = await Promise.all(ids.map((id) => getServerById(id)))
+      return res.json(rows.filter(Boolean))
+    }
     const list = await listServersForUser(user.id)
     res.json(list)
   } catch (e) {
@@ -723,10 +751,10 @@ app.post('/api/servers', async (req, res) => {
 
 app.get('/api/servers/:serverId', async (req, res) => {
   const user = getSessionUser(req)
-  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
   const serverId = String(req.params.serverId || '')
   if (!serverId) return res.status(400).json({ error: 'serverId required' })
-  const member = await isServerMember(user.id, serverId)
+  const member = await isSessionMember(user, serverId, req.session)
   if (!member) return res.status(403).json({ error: 'forbidden' })
   const server = await getServerById(serverId)
   if (!server) return res.status(404).json({ error: 'server not found' })
@@ -735,8 +763,12 @@ app.get('/api/servers/:serverId', async (req, res) => {
 
 app.get('/api/servers/order', async (req, res) => {
   const user = getSessionUser(req)
-  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
   try {
+    if (user.isGuest) {
+      const order = Array.isArray(req.session?.guestServerOrder) ? req.session.guestServerOrder : []
+      return res.json(order)
+    }
     if (serverOrdersCol) {
       const row = await serverOrdersCol.findOne({ userId: user.id }, { projection: { _id: 0 } })
       return res.json(Array.isArray(row?.order) ? row.order : [])
@@ -751,9 +783,13 @@ app.get('/api/servers/order', async (req, res) => {
 
 app.put('/api/servers/order', async (req, res) => {
   const user = getSessionUser(req)
-  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
   const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map((id) => String(id)) : []
   try {
+    if (user.isGuest) {
+      req.session.guestServerOrder = orderedIds
+      return res.json({ ok: true })
+    }
     if (serverOrdersCol) {
       await serverOrdersCol.updateOne(
         { userId: user.id },
@@ -830,10 +866,10 @@ app.delete('/api/servers/:serverId/admins/:id', async (req, res) => {
 
 app.get('/api/servers/:serverId/channels', async (req, res) => {
   const user = getSessionUser(req)
-  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
   const serverId = String(req.params.serverId || '')
   if (!serverId) return res.status(400).json({ error: 'serverId required' })
-  const member = await isServerMember(user.id, serverId)
+  const member = await isSessionMember(user, serverId, req.session)
   if (!member) return res.status(403).json({ error: 'forbidden' })
   try {
     let allChannels = await listChannels(serverId)
@@ -1170,7 +1206,7 @@ app.get('/api/invite/:code', async (req, res) => {
 
 app.post('/api/invite/:code/join', async (req, res) => {
   const user = getSessionUser(req)
-  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
   const code = String(req.params.code || '').trim()
   if (!code) return res.status(400).json({ error: 'code required' })
   const invite = await getInviteByCode(code)
@@ -1178,9 +1214,13 @@ app.post('/api/invite/:code/join', async (req, res) => {
   if (isInviteExpired(invite)) return res.status(410).json({ error: 'invite expired' })
   const server = await getServerById(invite.serverId)
   if (!server) return res.status(404).json({ error: 'server not found' })
-  const member = await isServerMember(user.id, server.id)
-  if (!member) {
-    await addMembership({ userId: user.id, serverId: server.id, role: 'member' })
+  if (user.isGuest) {
+    addGuestServer(req.session, server.id)
+  } else {
+    const member = await isServerMember(user.id, server.id)
+    if (!member) {
+      await addMembership({ userId: user.id, serverId: server.id, role: 'member' })
+    }
   }
   res.json({ server })
 })
@@ -1213,12 +1253,12 @@ function normalizeMessageRow(row) {
 
 app.get('/api/history', async (req, res) => {
   const user = getSessionUser(req)
-  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
   const limit = Math.min(Number(req.query.limit) || 200, MESSAGE_HISTORY_LIMIT)
   const channelId = String(req.query.channelId || 'general')
   const channel = await getChannelById(channelId)
   if (!channel) return res.status(404).json({ error: 'channel not found' })
-  const member = await isServerMember(user.id, channel.serverId)
+  const member = await isSessionMember(user, channel.serverId, req.session)
   if (!member) return res.status(403).json({ error: 'forbidden' })
   if (messagesCol) {
     try {
@@ -1306,7 +1346,7 @@ io.on('connection', (socket) => {
     if (!channel || channel.type !== 'voice') return
     const sessUser = resolveSessionUser()
     if (!sessUser) return
-    const member = await isServerMember(sessUser.id, channel.serverId)
+    const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
     if (!member) return
     socket.join(`voice:watch:${channelId}`)
     emitVoiceMembers(channelId)
@@ -1326,7 +1366,7 @@ io.on('connection', (socket) => {
     const channelId = typeof payload?.channelId === 'string' ? payload.channelId : 'general'
     const channel = await getChannelById(channelId)
     if (!channel) return
-    const member = await isServerMember(sessUser.id, channel.serverId)
+    const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
     if (!member) return
     if (channel.hidden && !await isServerAdmin(sessUser?.id, channel.serverId)) return
     const message = {
