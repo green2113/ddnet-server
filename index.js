@@ -1353,8 +1353,18 @@ const setScreenShareActive = (channelId, peerId, active) => {
 }
 
 io.on('connection', (socket) => {
-  const resolveSessionUser = () => {
-    const sess = socket.request?.session
+  const reloadSession = () =>
+    new Promise((resolve) => {
+      const sess = socket.request?.session
+      if (!sess || typeof sess.reload !== 'function') {
+        resolve(sess)
+        return
+      }
+      sess.reload(() => resolve(socket.request?.session || sess))
+    })
+
+  const resolveSessionUser = async () => {
+    const sess = await reloadSession()
     return sess?.passport?.user || sess?.localUser || sess?.guestUser
   }
   const isSocketInVoiceChannel = (channelId, socketId) =>
@@ -1365,7 +1375,7 @@ io.on('connection', (socket) => {
     if (!channelId) return
     const channel = await getChannelById(channelId)
     if (!channel || channel.type !== 'voice') return
-    const sessUser = resolveSessionUser()
+    const sessUser = await resolveSessionUser()
     if (!sessUser) return
     const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
     if (!member) return
@@ -1380,7 +1390,7 @@ io.on('connection', (socket) => {
   })
 
   socket.on('screen:announce', async (payload) => {
-    const sessUser = resolveSessionUser()
+    const sessUser = await resolveSessionUser()
     if (!sessUser) return
     const channelId = String(payload?.channelId || '')
     if (!channelId) return
@@ -1395,7 +1405,7 @@ io.on('connection', (socket) => {
   })
 
   socket.on('screen:list', async (payload, reply) => {
-    const sessUser = resolveSessionUser()
+    const sessUser = await resolveSessionUser()
     if (!sessUser) return
     const channelId = String(payload?.channelId || '')
     if (!channelId) return
@@ -1413,7 +1423,7 @@ io.on('connection', (socket) => {
   })
 
   socket.on('screen:request', async (payload) => {
-    const sessUser = resolveSessionUser()
+    const sessUser = await resolveSessionUser()
     if (!sessUser) return
     const channelId = String(payload?.channelId || '')
     const targetId = String(payload?.targetId || '')
@@ -1428,7 +1438,7 @@ io.on('connection', (socket) => {
   })
 
   socket.on('chat:send', async (payload) => {
-    const sessUser = resolveSessionUser()
+    const sessUser = await resolveSessionUser()
     if (!sessUser) {
       return // ignore unauthenticated send
     }
@@ -1488,7 +1498,7 @@ io.on('connection', (socket) => {
     try {
       const messageId = payload?.id
       if (!messageId) return
-      const sessUser = resolveSessionUser()
+      const sessUser = await resolveSessionUser()
       if (!sessUser) return
       let deleted = false
       let target = null
@@ -1525,7 +1535,7 @@ io.on('connection', (socket) => {
   })
 
   socket.on('voice:join', async (payload) => {
-    const sessUser = resolveSessionUser()
+    const sessUser = await resolveSessionUser()
     if (!sessUser) return
     const channelId = String(payload?.channelId || '')
     if (!channelId) return
