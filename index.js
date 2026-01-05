@@ -1326,6 +1326,7 @@ io.use((socket, next) => {
 
 const voiceMembers = new Map()
 const voiceMembersByUser = new Map()
+const activeScreenShares = new Map()
 
 const emitVoiceMembers = (channelId) => {
   const members = Array.from(voiceMembers.get(channelId)?.values() || [])
@@ -1333,11 +1334,31 @@ const emitVoiceMembers = (channelId) => {
   io.to(`voice:watch:${channelId}`).emit('voice:members', { channelId, members })
 }
 
+const setScreenShareActive = (channelId, peerId, active) => {
+  if (!channelId || !peerId) return
+  if (!active) {
+    const set = activeScreenShares.get(channelId)
+    if (set) {
+      set.delete(peerId)
+      if (set.size === 0) {
+        activeScreenShares.delete(channelId)
+      }
+    }
+    return
+  }
+  if (!activeScreenShares.has(channelId)) {
+    activeScreenShares.set(channelId, new Set())
+  }
+  activeScreenShares.get(channelId).add(peerId)
+}
+
 io.on('connection', (socket) => {
   const resolveSessionUser = () => {
     const sess = socket.request?.session
     return sess?.passport?.user || sess?.localUser || sess?.guestUser
   }
+  const isSocketInVoiceChannel = (channelId, socketId) =>
+    Boolean(voiceMembers.get(channelId)?.has(socketId))
 
   socket.on('voice:watch', async (payload) => {
     const channelId = String(payload?.channelId || '')
@@ -1356,6 +1377,54 @@ io.on('connection', (socket) => {
     const channelId = String(payload?.channelId || '')
     if (!channelId) return
     socket.leave(`voice:watch:${channelId}`)
+  })
+
+  socket.on('screen:announce', async (payload) => {
+    const sessUser = resolveSessionUser()
+    if (!sessUser) return
+    const channelId = String(payload?.channelId || '')
+    if (!channelId) return
+    const channel = await getChannelById(channelId)
+    if (!channel || channel.type !== 'voice') return
+    const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
+    if (!member) return
+    if (!isSocketInVoiceChannel(channelId, socket.id)) return
+    const active = Boolean(payload?.active)
+    setScreenShareActive(channelId, socket.id, active)
+    io.to(`voice:${channelId}`).emit('screen:announce', { channelId, peerId: socket.id, active })
+  })
+
+  socket.on('screen:list', async (payload, reply) => {
+    const sessUser = resolveSessionUser()
+    if (!sessUser) return
+    const channelId = String(payload?.channelId || '')
+    if (!channelId) return
+    const channel = await getChannelById(channelId)
+    if (!channel || channel.type !== 'voice') return
+    const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
+    if (!member) return
+    if (!isSocketInVoiceChannel(channelId, socket.id)) return
+    const peers = Array.from(activeScreenShares.get(channelId) || [])
+    if (typeof reply === 'function') {
+      reply({ channelId, peers })
+    } else {
+      socket.emit('screen:list', { channelId, peers })
+    }
+  })
+
+  socket.on('screen:request', async (payload) => {
+    const sessUser = resolveSessionUser()
+    if (!sessUser) return
+    const channelId = String(payload?.channelId || '')
+    const targetId = String(payload?.targetId || '')
+    if (!channelId || !targetId) return
+    const channel = await getChannelById(channelId)
+    if (!channel || channel.type !== 'voice') return
+    const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
+    if (!member) return
+    if (!isSocketInVoiceChannel(channelId, socket.id)) return
+    if (!isSocketInVoiceChannel(channelId, targetId)) return
+    socket.to(targetId).emit('screen:request', { channelId, fromId: socket.id })
   })
 
   socket.on('chat:send', async (payload) => {
@@ -1512,6 +1581,10 @@ io.on('connection', (socket) => {
   socket.on('voice:leave', (payload) => {
     const channelId = String(payload?.channelId || '')
     if (!channelId) return
+    if (activeScreenShares.has(channelId) && activeScreenShares.get(channelId).has(socket.id)) {
+      setScreenShareActive(channelId, socket.id, false)
+      io.to(`voice:${channelId}`).emit('screen:announce', { channelId, peerId: socket.id, active: false })
+    }
     const channelMembers = voiceMembers.get(channelId)
     const channelMembersByUser = voiceMembersByUser.get(channelId)
     if (channelMembers?.has(socket.id)) {
@@ -1570,6 +1643,11 @@ io.on('connection', (socket) => {
   })
 
   socket.on('disconnect', () => {
+    activeScreenShares.forEach((set, channelId) => {
+      if (!set.has(socket.id)) return
+      setScreenShareActive(channelId, socket.id, false)
+      io.to(`voice:${channelId}`).emit('screen:announce', { channelId, peerId: socket.id, active: false })
+    })
     voiceMembers.forEach((members, channelId) => {
       if (members.has(socket.id)) {
         members.delete(socket.id)
