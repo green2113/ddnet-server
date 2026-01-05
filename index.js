@@ -61,10 +61,54 @@ const messageHistory = []
 const DEFAULT_SERVER_NAME = process.env.DEFAULT_SERVER_NAME || 'Server'
 let defaultServerId = null
 
-const createDefaultChannels = (serverId, createdBy) => [
-  { id: generateSnowflakeId(), serverId, name: 'general', type: 'text', hidden: false, createdAt: Date.now(), createdBy, order: 0 },
-  { id: generateSnowflakeId(), serverId, name: 'voice', type: 'voice', hidden: false, createdAt: Date.now(), createdBy, order: 1 },
-]
+const createDefaultChannels = (serverId, createdBy) => {
+  const textCategoryId = generateSnowflakeId()
+  const voiceCategoryId = generateSnowflakeId()
+  return [
+    {
+      id: textCategoryId,
+      serverId,
+      name: '텍스트 채널',
+      type: 'category',
+      hidden: false,
+      createdAt: Date.now(),
+      createdBy,
+      order: 0,
+    },
+    {
+      id: generateSnowflakeId(),
+      serverId,
+      name: 'general',
+      type: 'text',
+      categoryId: textCategoryId,
+      hidden: false,
+      createdAt: Date.now(),
+      createdBy,
+      order: 1,
+    },
+    {
+      id: voiceCategoryId,
+      serverId,
+      name: '음성 채널',
+      type: 'category',
+      hidden: false,
+      createdAt: Date.now(),
+      createdBy,
+      order: 2,
+    },
+    {
+      id: generateSnowflakeId(),
+      serverId,
+      name: 'voice',
+      type: 'voice',
+      categoryId: voiceCategoryId,
+      hidden: false,
+      createdAt: Date.now(),
+      createdBy,
+      order: 3,
+    },
+  ]
+}
 
 let servers = []
 let memberships = []
@@ -206,7 +250,8 @@ async function listChannels(serverId) {
       .map((row, index) => ({
         ...row,
         order: Number.isFinite(row.order) ? row.order : (Number.isFinite(row.createdAt) ? row.createdAt : index),
-        type: row.type === 'voice' ? 'voice' : 'text',
+        type: row.type === 'voice' ? 'voice' : row.type === 'category' ? 'category' : 'text',
+        categoryId: row.categoryId || null,
         hidden: !!row.hidden,
       }))
       .sort((a, b) => {
@@ -219,7 +264,8 @@ async function listChannels(serverId) {
     .map((channel, index) => ({
       ...channel,
       order: Number.isFinite(channel.order) ? channel.order : (Number.isFinite(channel.createdAt) ? channel.createdAt : index),
-      type: channel.type === 'voice' ? 'voice' : 'text',
+      type: channel.type === 'voice' ? 'voice' : channel.type === 'category' ? 'category' : 'text',
+      categoryId: channel.categoryId || null,
     }))
     .sort((a, b) => {
       if (a.order !== b.order) return a.order - b.order
@@ -277,13 +323,19 @@ async function initMongo() {
   try {
     const indexes = await channelsCol.indexes()
     const legacy = indexes.find((idx) => idx?.name === 'name_1')
+    const legacyServerName = indexes.find(
+      (idx) => idx?.key?.serverId === 1 && idx?.key?.name === 1 && !Object.prototype.hasOwnProperty.call(idx.key || {}, 'type')
+    )
     if (legacy) {
       await channelsCol.dropIndex(legacy.name)
+    }
+    if (legacyServerName) {
+      await channelsCol.dropIndex(legacyServerName.name)
     }
   } catch (e) {
     console.warn('[mongo] channels index cleanup skipped', e?.message || e)
   }
-  await channelsCol.createIndex({ serverId: 1, name: 1 }, { unique: true })
+  await channelsCol.createIndex({ serverId: 1, name: 1, type: 1 }, { unique: true })
   serversCol = db.collection(process.env.MONGO_SERVERS_COLL || 'servers')
   await serversCol.createIndex({ id: 1 }, { unique: true })
   membershipsCol = db.collection(process.env.MONGO_MEMBERSHIPS_COLL || 'memberships')
@@ -466,6 +518,8 @@ app.post('/auth/logout', (req, res) => {
 })
 
 const normalizeEmail = (value) => String(value || '').trim().toLowerCase()
+const normalizeHandle = (value) => String(value || '').trim().replace(/^@+/, '')
+const isValidHandle = (value) => /^[A-Za-z0-9_]{1,8}$/.test(value)
 
 const SNOWFLAKE_EPOCH = BigInt(Number(process.env.SNOWFLAKE_EPOCH || 1704067200000)) // 2024-01-01
 const SNOWFLAKE_WORKER_ID = BigInt(Number(process.env.SNOWFLAKE_WORKER_ID || 1) & 0x3ff)
@@ -513,6 +567,21 @@ const findUserByEmail = async (email) => {
   return users.find((user) => user.email === email) || null
 }
 
+const findUserByHandle = async (handle) => {
+  const rawHandle = normalizeHandle(handle)
+  if (!rawHandle) return null
+  const handleWithAt = `@${rawHandle}`
+  if (usersCol) {
+    const existing = await usersCol.findOne(
+      { username: { $in: [rawHandle, handleWithAt] } },
+      { projection: { _id: 0 } },
+    )
+    if (!existing) return null
+    return normalizeHandle(existing.username) === rawHandle ? existing : null
+  }
+  return users.find((user) => normalizeHandle(user.username) === rawHandle) || null
+}
+
 const insertUser = async (user) => {
   if (usersCol) {
     await usersCol.insertOne(user)
@@ -524,23 +593,31 @@ const insertUser = async (user) => {
 app.post('/auth/register', async (req, res) => {
   const email = normalizeEmail(req.body?.email)
   const password = String(req.body?.password || '')
-  const username = String(req.body?.username || '').trim()
-  if (!email || !password || !username) {
+  const rawHandle = normalizeHandle(req.body?.username)
+  if (!email || !password || !rawHandle) {
     return res.status(400).json({ error: 'email, password, username required' })
+  }
+  if (!isValidHandle(rawHandle)) {
+    return res.status(400).json({ error: 'username invalid' })
   }
   if (password.length < 6) {
     return res.status(400).json({ error: 'password too short' })
+  }
+  const handleTaken = await findUserByHandle(rawHandle)
+  if (handleTaken) {
+    return res.status(409).json({ error: 'username already used' })
   }
   const existing = await findUserByEmail(email)
   if (existing) {
     return res.status(409).json({ error: 'email already used' })
   }
   const passwordHash = await bcrypt.hash(password, 10)
+  const handle = `@${rawHandle}`
   const user = {
     id: generateSnowflakeId(),
     email,
-    username: username.slice(0, 32),
-    displayName: username.slice(0, 32),
+    username: handle,
+    displayName: handle,
     avatar: null,
     passwordHash,
     createdAt: Date.now(),
@@ -555,6 +632,15 @@ app.post('/auth/register', async (req, res) => {
     console.error('[auth] register failed', e?.message || e)
     res.status(500).json({ error: 'failed to register' })
   }
+})
+
+app.get('/auth/username-check', async (req, res) => {
+  const rawHandle = normalizeHandle(req.query?.username)
+  if (!rawHandle || !isValidHandle(rawHandle)) {
+    return res.json({ available: false })
+  }
+  const existing = await findUserByHandle(rawHandle)
+  res.json({ available: !existing })
 })
 
 app.post('/auth/login', async (req, res) => {
@@ -750,7 +836,46 @@ app.get('/api/servers/:serverId/channels', async (req, res) => {
   const member = await isServerMember(user.id, serverId)
   if (!member) return res.status(403).json({ error: 'forbidden' })
   try {
-    const allChannels = await listChannels(serverId)
+    let allChannels = await listChannels(serverId)
+    if (!allChannels.some((channel) => channel.type === 'category')) {
+      const textCategoryId = generateSnowflakeId()
+      const voiceCategoryId = generateSnowflakeId()
+      const now = Date.now()
+      const categories = [
+        {
+          id: textCategoryId,
+          serverId,
+          name: '텍스트 채널',
+          type: 'category',
+          hidden: false,
+          createdAt: now,
+          createdBy: user.id,
+          order: 0,
+        },
+        {
+          id: voiceCategoryId,
+          serverId,
+          name: '음성 채널',
+          type: 'category',
+          hidden: false,
+          createdAt: now + 1,
+          createdBy: user.id,
+          order: 1,
+        },
+      ]
+      for (const category of categories) {
+        await upsertChannel(category)
+      }
+      const updates = allChannels.map((channel, index) => {
+        const categoryId = channel.type === 'voice' ? voiceCategoryId : textCategoryId
+        const nextOrder = Number.isFinite(channel.order) ? channel.order : index
+        return { ...channel, categoryId, order: nextOrder + 2 }
+      })
+      for (const channel of updates) {
+        await upsertChannel(channel)
+      }
+      allChannels = await listChannels(serverId)
+    }
     const isAdmin = await isServerAdmin(user.id, serverId)
     const visible = isAdmin ? allChannels : allChannels.filter((channel) => !channel.hidden)
     res.json(visible)
@@ -768,15 +893,24 @@ app.post('/api/servers/:serverId/channels', async (req, res) => {
   if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
   const name = String(req.body?.name || '').trim()
   if (!name) return res.status(400).json({ error: 'name required' })
-  const type = req.body?.type === 'voice' ? 'voice' : 'text'
+  const type = req.body?.type === 'category' ? 'category' : req.body?.type === 'voice' ? 'voice' : 'text'
+  const requestedCategoryId = req.body?.categoryId ? String(req.body.categoryId) : null
   const order = channelsCol
     ? await channelsCol.countDocuments({ serverId })
     : channels.filter((channel) => channel.serverId === serverId).length
+  let categoryId = null
+  if (type !== 'category' && requestedCategoryId) {
+    const category = await getChannelById(requestedCategoryId)
+    if (category && category.serverId === serverId && category.type === 'category') {
+      categoryId = category.id
+    }
+  }
   const channel = {
     id: generateSnowflakeId(),
     serverId,
     name,
     type,
+    categoryId,
     hidden: false,
     createdAt: Date.now(),
     createdBy: user.id,
@@ -802,6 +936,13 @@ app.delete('/api/servers/:serverId/channels/:id', async (req, res) => {
   try {
     const channel = await getChannelById(channelId)
     if (!channel || channel.serverId !== serverId) return res.status(404).json({ error: 'channel not found' })
+    if (channel.type === 'category') {
+      if (channelsCol) {
+        await channelsCol.updateMany({ serverId, categoryId: channelId }, { $set: { categoryId: null } })
+      } else {
+        channels = channels.map((row) => (row.categoryId === channelId ? { ...row, categoryId: null } : row))
+      }
+    }
     await removeChannel(channelId)
     if (messagesCol) {
       await messagesCol.deleteMany({ channelId })
@@ -870,10 +1011,12 @@ app.patch('/api/servers/:serverId/channels/order', async (req, res) => {
   if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
   const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map((id) => String(id)) : []
   if (orderedIds.length === 0) return res.status(400).json({ error: 'orderedIds required' })
+  const categoryId = req.body?.categoryId ? String(req.body.categoryId) : null
   try {
     if (channelsCol) {
       const rows = await channelsCol.find({ serverId }, { projection: { _id: 0 } }).toArray()
-      const channelMap = new Map(rows.map((row) => [row.id, row]))
+      const targetRows = rows.filter((row) => row.type !== 'category' && (categoryId ? row.categoryId === categoryId : !row.categoryId))
+      const channelMap = new Map(targetRows.map((row) => [row.id, row]))
       const used = new Set()
       let order = 0
       const updates = []
@@ -882,14 +1025,15 @@ app.patch('/api/servers/:serverId/channels/order', async (req, res) => {
         used.add(id)
         updates.push({ id, order: order++ })
       })
-      rows.forEach((row) => {
+      targetRows.forEach((row) => {
         if (used.has(row.id)) return
         updates.push({ id: row.id, order: order++ })
       })
       await Promise.all(updates.map((update) => channelsCol.updateOne({ id: update.id }, { $set: { order: update.order } })))
     } else {
       const serverChannels = channels.filter((channel) => channel.serverId === serverId)
-      const channelMap = new Map(serverChannels.map((channel) => [channel.id, channel]))
+      const targetChannels = serverChannels.filter((channel) => channel.type !== 'category' && (categoryId ? channel.categoryId === categoryId : !channel.categoryId))
+      const channelMap = new Map(targetChannels.map((channel) => [channel.id, channel]))
       const used = new Set()
       let order = 0
       const ordered = []
@@ -899,7 +1043,7 @@ app.patch('/api/servers/:serverId/channels/order', async (req, res) => {
         used.add(id)
         ordered.push({ ...channel, order: order++ })
       })
-      serverChannels.forEach((channel) => {
+      targetChannels.forEach((channel) => {
         if (used.has(channel.id)) return
         ordered.push({ ...channel, order: order++ })
       })
@@ -913,6 +1057,60 @@ app.patch('/api/servers/:serverId/channels/order', async (req, res) => {
   } catch (e) {
     console.error('[channels] order failed', e?.message || e)
     res.status(500).json({ error: 'failed to reorder channels' })
+  }
+})
+
+app.patch('/api/servers/:serverId/categories/order', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  const orderedIds = Array.isArray(req.body?.orderedIds) ? req.body.orderedIds.map((id) => String(id)) : []
+  if (orderedIds.length === 0) return res.status(400).json({ error: 'orderedIds required' })
+  try {
+    if (channelsCol) {
+      const rows = await channelsCol.find({ serverId, type: 'category' }, { projection: { _id: 0 } }).toArray()
+      const categoryMap = new Map(rows.map((row) => [row.id, row]))
+      const used = new Set()
+      let order = 0
+      const updates = []
+      orderedIds.forEach((id) => {
+        if (!categoryMap.has(id)) return
+        used.add(id)
+        updates.push({ id, order: order++ })
+      })
+      rows.forEach((row) => {
+        if (used.has(row.id)) return
+        updates.push({ id: row.id, order: order++ })
+      })
+      await Promise.all(updates.map((update) => channelsCol.updateOne({ id: update.id }, { $set: { order: update.order } })))
+    } else {
+      const serverChannels = channels.filter((channel) => channel.serverId === serverId && channel.type === 'category')
+      const categoryMap = new Map(serverChannels.map((channel) => [channel.id, channel]))
+      const used = new Set()
+      let order = 0
+      const ordered = []
+      orderedIds.forEach((id) => {
+        const category = categoryMap.get(id)
+        if (!category) return
+        used.add(id)
+        ordered.push({ ...category, order: order++ })
+      })
+      serverChannels.forEach((category) => {
+        if (used.has(category.id)) return
+        ordered.push({ ...category, order: order++ })
+      })
+      channels = channels.map((channel) => {
+        const next = ordered.find((item) => item.id === channel.id)
+        return next || channel
+      })
+    }
+    io.emit('channels:update', { serverId })
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[categories] order failed', e?.message || e)
+    res.status(500).json({ error: 'failed to reorder categories' })
   }
 })
 
