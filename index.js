@@ -175,19 +175,11 @@ const listServersForUser = async (userId) => {
   if (!userId) return []
   if (membershipsCol) {
     const rows = await membershipsCol.find({ userId }, { projection: { _id: 0 } }).toArray()
-    if (rows.length === 0 && defaultServerId) {
-      await addMembership({ userId, serverId: defaultServerId, role: 'member' })
-      return listServersForUser(userId)
-    }
     const ids = rows.map((row) => row.serverId)
     if (!ids.length) return []
     return serversCol.find({ id: { $in: ids } }, { projection: { _id: 0 } }).toArray()
   }
   const joined = memberships.filter((m) => m.userId === userId).map((m) => m.serverId)
-  if (!joined.length && defaultServerId) {
-    memberships.push({ userId, serverId: defaultServerId, role: 'member', joinedAt: Date.now() })
-    return listServersForUser(userId)
-  }
   return servers.filter((server) => joined.includes(server.id))
 }
 
