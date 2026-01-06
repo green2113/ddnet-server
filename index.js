@@ -873,45 +873,6 @@ app.get('/api/servers/:serverId/channels', async (req, res) => {
   if (!member) return res.status(403).json({ error: 'forbidden' })
   try {
     let allChannels = await listChannels(serverId)
-    if (!allChannels.some((channel) => channel.type === 'category')) {
-      const textCategoryId = generateSnowflakeId()
-      const voiceCategoryId = generateSnowflakeId()
-      const now = Date.now()
-      const categories = [
-        {
-          id: textCategoryId,
-          serverId,
-          name: '텍스트 채널',
-          type: 'category',
-          hidden: false,
-          createdAt: now,
-          createdBy: user.id,
-          order: 0,
-        },
-        {
-          id: voiceCategoryId,
-          serverId,
-          name: '음성 채널',
-          type: 'category',
-          hidden: false,
-          createdAt: now + 1,
-          createdBy: user.id,
-          order: 1,
-        },
-      ]
-      for (const category of categories) {
-        await upsertChannel(category)
-      }
-      const updates = allChannels.map((channel, index) => {
-        const categoryId = channel.type === 'voice' ? voiceCategoryId : textCategoryId
-        const nextOrder = Number.isFinite(channel.order) ? channel.order : index
-        return { ...channel, categoryId, order: nextOrder + 2 }
-      })
-      for (const channel of updates) {
-        await upsertChannel(channel)
-      }
-      allChannels = await listChannels(serverId)
-    }
     const isAdmin = await isServerAdmin(user.id, serverId)
     const visible = isAdmin ? allChannels : allChannels.filter((channel) => !channel.hidden)
     res.json(visible)
