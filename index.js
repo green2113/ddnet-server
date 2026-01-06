@@ -810,6 +810,44 @@ app.get('/api/servers', async (req, res) => {
   }
 })
 
+app.get('/api/servers/:serverId/members', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  const member = await isSessionMember(user, serverId, req.session)
+  if (!member) return res.status(403).json({ error: 'forbidden' })
+  try {
+    if (membershipsCol && usersCol) {
+      const rows = await membershipsCol.find({ serverId }, { projection: { _id: 0 } }).toArray()
+      const userIds = rows.map((row) => row.userId)
+      if (!userIds.length) return res.json([])
+      const users = await usersCol.find({ id: { $in: userIds } }, { projection: { _id: 0 } }).toArray()
+      return res.json(
+        users.map((u) => ({
+          id: u.id,
+          username: u.username,
+          displayName: u.displayName,
+          avatar: u.avatar || null,
+          isGuest: false,
+        })),
+      )
+    }
+    const memberIds = memberships.filter((m) => m.serverId === serverId).map((m) => m.userId)
+    const list = users.filter((u) => memberIds.includes(u.id)).map((u) => ({
+      id: u.id,
+      username: u.username,
+      displayName: u.displayName,
+      avatar: u.avatar || null,
+      isGuest: false,
+    }))
+    res.json(list)
+  } catch (e) {
+    console.error('[servers] members failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load members' })
+  }
+})
+
 app.post('/api/servers', async (req, res) => {
   const user = getSessionUser(req)
   if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
