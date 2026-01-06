@@ -426,6 +426,7 @@ const ALLOWED_MIME_TYPES = new Set([
   'text/plain',
   'application/zip',
 ])
+const AVATAR_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 const R2_ENDPOINT = process.env.R2_ENDPOINT || ''
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || ''
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || ''
@@ -592,6 +593,18 @@ const toPublicUser = (user) => ({
   authType: user.authType || 'local',
 })
 
+const updateUserById = async (id, updates) => {
+  if (!id) return null
+  if (usersCol) {
+    await usersCol.updateOne({ id }, { $set: updates })
+    return usersCol.findOne({ id }, { projection: { _id: 0 } })
+  }
+  const idx = users.findIndex((u) => u.id === id)
+  if (idx === -1) return null
+  users[idx] = { ...users[idx], ...updates }
+  return users[idx]
+}
+
 const findUserByEmail = async (email) => {
   if (usersCol) {
     return usersCol.findOne({ email }, { projection: { _id: 0 } })
@@ -700,6 +713,69 @@ app.get('/api/me', (req, res) => {
   if (req.user) return res.json({ ...req.user, isGuest: false })
   if (req.session?.guestUser) return res.json(req.session.guestUser)
   res.json(null)
+})
+
+app.patch('/api/users/me', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const displayName = String(req.body?.displayName || '').trim()
+  if (!displayName) return res.status(400).json({ error: 'displayName required' })
+  if (displayName.length > 32) return res.status(400).json({ error: 'displayName too long' })
+  try {
+    const updated = await updateUserById(user.id, { displayName })
+    if (!updated) return res.status(404).json({ error: 'user not found' })
+    const publicUser = toPublicUser(updated)
+    req.session.localUser = publicUser
+    if (req.user) req.user = publicUser
+    res.json(publicUser)
+  } catch (e) {
+    console.error('[user] update failed', e?.message || e)
+    res.status(500).json({ error: 'update failed' })
+  }
+})
+
+app.post('/api/users/me/avatar', upload.single('avatar'), async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  if (!r2Client || !R2_BUCKET || !R2_PUBLIC_BASE_URL) {
+    return res.status(500).json({ error: 'upload not configured' })
+  }
+  const file = req.file
+  if (!file) return res.status(400).json({ error: 'file required' })
+  if (!AVATAR_MIME_TYPES.has(file.mimetype)) {
+    return res.status(400).json({ error: 'file type not allowed' })
+  }
+  const ext =
+    file.mimetype === 'image/png'
+      ? '.png'
+      : file.mimetype === 'image/jpeg'
+        ? '.jpg'
+        : file.mimetype === 'image/webp'
+          ? '.webp'
+          : file.mimetype === 'image/gif'
+            ? '.gif'
+            : ''
+  const key = `avatars/${user.id}/avatar${ext || ''}`
+  try {
+    await r2Client.send(
+      new PutObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: key,
+        Body: file.buffer,
+        ContentType: file.mimetype || 'application/octet-stream',
+      }),
+    )
+    const url = buildPublicUrl(key)
+    const updated = await updateUserById(user.id, { avatar: url })
+    if (!updated) return res.status(404).json({ error: 'user not found' })
+    const publicUser = toPublicUser(updated)
+    req.session.localUser = publicUser
+    if (req.user) req.user = publicUser
+    res.status(201).json(publicUser)
+  } catch (err) {
+    console.error('[avatar] upload failed', err?.message || err)
+    res.status(500).json({ error: 'upload failed' })
+  }
 })
 
 app.post('/auth/guest', (req, res) => {
