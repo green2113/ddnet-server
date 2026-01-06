@@ -3,6 +3,7 @@ import express from 'express'
 import cors from 'cors'
 import cookieParser from 'cookie-parser'
 import session from 'express-session'
+import MongoStore from 'connect-mongo'
 import passport from 'passport'
 import { Strategy as DiscordStrategy } from 'passport-discord'
 import { createServer } from 'http'
@@ -398,10 +399,18 @@ if (!process.env.MONGODB_URI) {
 }
 
 const isHttps = (ORIGIN || '').startsWith('https://')
+const sessionStore = process.env.MONGODB_URI
+  ? MongoStore.create({
+      mongoUrl: process.env.MONGODB_URI,
+      collectionName: 'sessions',
+    })
+  : undefined
+
 const sessionMiddleware = session({
   secret: process.env.SESSION_SECRET || 'dev_secret_change_me',
   resave: false,
   saveUninitialized: false,
+  store: sessionStore,
   cookie: { secure: isHttps, sameSite: isHttps ? 'none' : 'lax' },
 })
 app.use(sessionMiddleware)
