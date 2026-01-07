@@ -171,6 +171,33 @@ const addMembership = async ({ userId, serverId, role }) => {
   }
 }
 
+const removeMembership = async (userId, serverId) => {
+  if (!userId || !serverId) return
+  if (membershipsCol) {
+    await membershipsCol.deleteOne({ userId, serverId })
+    return
+  }
+  memberships = memberships.filter((m) => !(m.userId === userId && m.serverId === serverId))
+}
+
+const removeServerFromOrder = async (userId, serverId) => {
+  if (!userId || !serverId) return
+  if (serverOrdersCol) {
+    const row = await serverOrdersCol.findOne({ userId }, { projection: { _id: 0 } })
+    const next = Array.isArray(row?.order) ? row.order.filter((id) => id !== serverId) : []
+    await serverOrdersCol.updateOne(
+      { userId },
+      { $set: { userId, order: next, updatedAt: Date.now() } },
+      { upsert: true }
+    )
+    return
+  }
+  const prev = serverOrders.get(userId)
+  if (Array.isArray(prev)) {
+    serverOrders.set(userId, prev.filter((id) => id !== serverId))
+  }
+}
+
 const listServersForUser = async (userId) => {
   if (!userId) return []
   if (membershipsCol) {
@@ -874,6 +901,33 @@ app.get('/api/servers/:serverId', async (req, res) => {
   const server = await getServerById(serverId)
   if (!server) return res.status(404).json({ error: 'server not found' })
   res.json(server)
+})
+
+app.delete('/api/servers/:serverId/leave', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  const member = await isSessionMember(user, serverId, req.session)
+  if (!member) return res.status(403).json({ error: 'forbidden' })
+  if (!user.isGuest && await isServerOwner(user.id, serverId)) {
+    return res.status(400).json({ error: 'owner cannot leave' })
+  }
+  try {
+    if (user.isGuest) {
+      const list = getGuestServerIds(req.session).filter((id) => id !== serverId)
+      req.session.guestServers = list
+      const order = Array.isArray(req.session.guestServerOrder) ? req.session.guestServerOrder : []
+      req.session.guestServerOrder = order.filter((id) => id !== serverId)
+      return res.json({ ok: true })
+    }
+    await removeMembership(user.id, serverId)
+    await removeServerFromOrder(user.id, serverId)
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[servers] leave failed', e?.message || e)
+    res.status(500).json({ error: 'failed to leave server' })
+  }
 })
 
 app.get('/api/servers/order', async (req, res) => {
