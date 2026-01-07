@@ -116,6 +116,7 @@ let memberships = []
 let invites = []
 let channels = []
 let serverOrders = new Map()
+let serverBans = []
 
 const isServerMember = async (userId, serverId) => {
   if (!userId || !serverId) return false
@@ -233,12 +234,66 @@ const listAdmins = async (serverId) => {
   return memberships.filter((m) => m.serverId === serverId && (m.role === 'owner' || m.role === 'admin')).map((m) => m.userId)
 }
 
+const listServerBans = async (serverId) => {
+  if (!serverId) return []
+  if (serverBansCol) {
+    return serverBansCol.find({ serverId }, { projection: { _id: 0 } }).toArray()
+  }
+  return serverBans.filter((ban) => ban.serverId === serverId)
+}
+
+const isServerBanned = async (userId, serverId) => {
+  if (!userId || !serverId) return false
+  if (serverBansCol) {
+    const row = await serverBansCol.findOne({ serverId, userId }, { projection: { _id: 0 } })
+    return !!row
+  }
+  return serverBans.some((ban) => ban.serverId === serverId && ban.userId === userId)
+}
+
+const addServerBan = async ({ serverId, userId, createdBy }) => {
+  if (!serverId || !userId) return
+  const record = { serverId, userId, createdAt: Date.now(), createdBy }
+  if (serverBansCol) {
+    await serverBansCol.updateOne({ serverId, userId }, { $set: record }, { upsert: true })
+    return
+  }
+  const idx = serverBans.findIndex((ban) => ban.serverId === serverId && ban.userId === userId)
+  if (idx >= 0) serverBans[idx] = record
+  else serverBans.push(record)
+}
+
+const removeServerBan = async (serverId, userId) => {
+  if (!serverId || !userId) return
+  if (serverBansCol) {
+    await serverBansCol.deleteOne({ serverId, userId })
+    return
+  }
+  serverBans = serverBans.filter((ban) => !(ban.serverId === serverId && ban.userId === userId))
+}
+
 const getServerById = async (serverId) => {
   if (!serverId) return null
   if (serversCol) {
     return serversCol.findOne({ id: serverId }, { projection: { _id: 0 } })
   }
   return servers.find((server) => server.id === serverId) || null
+}
+
+const updateServerById = async (serverId, updates) => {
+  if (!serverId || !updates || typeof updates !== 'object') return null
+  if (serversCol) {
+    const result = await serversCol.findOneAndUpdate(
+      { id: serverId },
+      { $set: updates },
+      { returnDocument: 'after', projection: { _id: 0 } },
+    )
+    return result?.value || null
+  }
+  const index = servers.findIndex((server) => server.id === serverId)
+  if (index === -1) return null
+  servers[index] = { ...servers[index], ...updates }
+  return servers[index]
 }
 
 const insertServer = async (server) => {
@@ -353,6 +408,7 @@ let membershipsCol
 let invitesCol
 let usersCol
 let serverOrdersCol
+let serverBansCol
 const users = []
 async function initMongo() {
   const uri = process.env.MONGODB_URI
@@ -389,10 +445,12 @@ async function initMongo() {
   await usersCol.createIndex({ email: 1 }, { unique: true })
   serverOrdersCol = db.collection(process.env.MONGO_SERVER_ORDERS_COLL || 'server_orders')
   await serverOrdersCol.createIndex({ userId: 1 }, { unique: true })
+  serverBansCol = db.collection(process.env.MONGO_BANS_COLL || 'server_bans')
+  await serverBansCol.createIndex({ serverId: 1, userId: 1 }, { unique: true })
   const serverCount = await serversCol.countDocuments()
   if (serverCount === 0) {
     const ownerId = DEFAULT_ADMIN_IDS[0] || 'system'
-    const server = { id: generateSnowflakeId(), name: DEFAULT_SERVER_NAME, ownerId, createdAt: Date.now() }
+    const server = { id: generateSnowflakeId(), name: DEFAULT_SERVER_NAME, ownerId, icon: null, createdAt: Date.now() }
     await serversCol.insertOne(server)
     defaultServerId = server.id
     const defaultChannels = createDefaultChannels(server.id, ownerId)
@@ -410,7 +468,7 @@ async function initMongo() {
 initMongo().catch((e) => console.error('[mongo] init failed', e?.message || e))
 if (!process.env.MONGODB_URI) {
   const ownerId = DEFAULT_ADMIN_IDS[0] || 'system'
-  const server = { id: generateSnowflakeId(), name: DEFAULT_SERVER_NAME, ownerId, createdAt: Date.now() }
+  const server = { id: generateSnowflakeId(), name: DEFAULT_SERVER_NAME, ownerId, icon: null, createdAt: Date.now() }
   servers = [server]
   defaultServerId = server.id
   channels = createDefaultChannels(server.id, ownerId)
@@ -629,6 +687,14 @@ const updateUserById = async (id, updates) => {
   if (idx === -1) return null
   users[idx] = { ...users[idx], ...updates }
   return users[idx]
+}
+
+const getUserById = async (id) => {
+  if (!id) return null
+  if (usersCol) {
+    return usersCol.findOne({ id }, { projection: { _id: 0 } })
+  }
+  return users.find((user) => user.id === id) || null
 }
 
 const findUserByEmail = async (email) => {
@@ -883,6 +949,7 @@ app.post('/api/servers', async (req, res) => {
     id: generateSnowflakeId(),
     name: name.slice(0, 64),
     ownerId: user.id,
+    icon: null,
     createdAt: Date.now(),
   }
   try {
@@ -908,6 +975,71 @@ app.get('/api/servers/:serverId', async (req, res) => {
   const server = await getServerById(serverId)
   if (!server) return res.status(404).json({ error: 'server not found' })
   res.json(server)
+})
+
+app.patch('/api/servers/:serverId', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  const name = String(req.body?.name || '').trim()
+  if (!name) return res.status(400).json({ error: 'name required' })
+  if (name.length > 64) return res.status(400).json({ error: 'name too long' })
+  try {
+    const updated = await updateServerById(serverId, { name })
+    if (!updated) return res.status(404).json({ error: 'server not found' })
+    io.emit('servers:update', { serverId })
+    res.json(updated)
+  } catch (e) {
+    console.error('[servers] update failed', e?.message || e)
+    res.status(500).json({ error: 'failed to update server' })
+  }
+})
+
+app.post('/api/servers/:serverId/icon', upload.single('icon'), async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  if (!r2Client || !R2_BUCKET || !R2_PUBLIC_BASE_URL) {
+    return res.status(500).json({ error: 'upload not configured' })
+  }
+  const file = req.file
+  if (!file) return res.status(400).json({ error: 'file required' })
+  if (!AVATAR_MIME_TYPES.has(file.mimetype)) {
+    return res.status(400).json({ error: 'file type not allowed' })
+  }
+  const ext =
+    file.mimetype === 'image/png'
+      ? '.png'
+      : file.mimetype === 'image/jpeg'
+        ? '.jpg'
+        : file.mimetype === 'image/webp'
+          ? '.webp'
+          : file.mimetype === 'image/gif'
+            ? '.gif'
+            : ''
+  const key = `servers/${serverId}/icon${ext || ''}`
+  try {
+    await r2Client.send(
+      new PutObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: key,
+        Body: file.buffer,
+        ContentType: file.mimetype || 'application/octet-stream',
+      }),
+    )
+    const url = buildPublicUrl(key)
+    const updated = await updateServerById(serverId, { icon: url })
+    if (!updated) return res.status(404).json({ error: 'server not found' })
+    io.emit('servers:update', { serverId })
+    res.status(201).json(updated)
+  } catch (err) {
+    console.error('[servers] icon upload failed', err?.message || err)
+    res.status(500).json({ error: 'upload failed' })
+  }
 })
 
 app.delete('/api/servers/:serverId/leave', async (req, res) => {
@@ -1037,6 +1169,84 @@ app.delete('/api/servers/:serverId/admins/:id', async (req, res) => {
   } catch (e) {
     console.error('[admins] remove failed', e?.message || e)
     res.status(500).json({ error: 'failed to remove admin' })
+  }
+})
+
+app.post('/api/servers/:serverId/kick', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  const targetId = String(req.body?.userId || '')
+  if (!serverId || !targetId) return res.status(400).json({ error: 'userId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  if (await isServerOwner(targetId, serverId)) return res.status(400).json({ error: 'cannot kick owner' })
+  try {
+    await removeMembership(targetId, serverId)
+    await removeServerFromOrder(targetId, serverId)
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[servers] kick failed', e?.message || e)
+    res.status(500).json({ error: 'failed to kick' })
+  }
+})
+
+app.get('/api/servers/:serverId/bans', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  try {
+    const rows = await listServerBans(serverId)
+    const ids = rows.map((row) => row.userId)
+    const list = await Promise.all(ids.map(async (id) => {
+      const u = await getUserById(id)
+      return {
+        id,
+        username: u?.username || id,
+        displayName: u?.displayName || u?.username || id,
+        avatar: u?.avatar || null,
+      }
+    }))
+    res.json(list)
+  } catch (e) {
+    console.error('[servers] bans failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load bans' })
+  }
+})
+
+app.post('/api/servers/:serverId/bans', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  const targetId = String(req.body?.userId || '')
+  if (!serverId || !targetId) return res.status(400).json({ error: 'userId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  if (await isServerOwner(targetId, serverId)) return res.status(400).json({ error: 'cannot ban owner' })
+  try {
+    await addServerBan({ serverId, userId: targetId, createdBy: user.id })
+    await removeMembership(targetId, serverId)
+    await removeServerFromOrder(targetId, serverId)
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[servers] ban failed', e?.message || e)
+    res.status(500).json({ error: 'failed to ban' })
+  }
+})
+
+app.delete('/api/servers/:serverId/bans/:id', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  const targetId = String(req.params.id || '')
+  if (!serverId || !targetId) return res.status(400).json({ error: 'userId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  try {
+    await removeServerBan(serverId, targetId)
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[servers] unban failed', e?.message || e)
+    res.status(500).json({ error: 'failed to unban' })
   }
 })
 
@@ -1351,6 +1561,9 @@ app.post('/api/invite/:code/join', async (req, res) => {
   if (isInviteExpired(invite)) return res.status(410).json({ error: 'invite expired' })
   const server = await getServerById(invite.serverId)
   if (!server) return res.status(404).json({ error: 'server not found' })
+  if (await isServerBanned(user.id, server.id)) {
+    return res.status(403).json({ error: 'banned' })
+  }
   if (user.isGuest) {
     addGuestServer(req.session, server.id)
   } else {
