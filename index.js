@@ -18,6 +18,12 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 const app = express()
 const DEFAULT_ADMIN_IDS = ['776421522188664843']
 const ORIGIN = process.env.WEB_ORIGIN || ''
+const TURN_URLS = (process.env.TURN_URLS || process.env.TURN_URL || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
+const TURN_USERNAME = process.env.TURN_USERNAME || ''
+const TURN_PASSWORD = process.env.TURN_PASSWORD || ''
 if (!ORIGIN) {
   console.warn('[WARN] WEB_ORIGIN is not set. Falling back to http://localhost:5173 for redirects.')
 }
@@ -30,6 +36,14 @@ const allowNullOrigin = corsOrigins.includes('null')
 const allowFileOrigin = corsOrigins.includes('file://') || corsOrigins.includes('file')
 const allowAppOrigin = corsOrigins.includes('app://')
 const corsOriginSet = new Set(corsOrigins)
+
+const buildIceServers = () => {
+  const servers = [{ urls: 'stun:stun.l.google.com:19302' }]
+  if (TURN_URLS.length && TURN_USERNAME && TURN_PASSWORD) {
+    servers.push({ urls: TURN_URLS, username: TURN_USERNAME, credential: TURN_PASSWORD })
+  }
+  return servers
+}
 
 const corsOriginHandler = (origin, callback) => {
   if (allowAllOrigins) return callback(null, true)
@@ -805,6 +819,13 @@ app.get('/api/me', (req, res) => {
   if (req.user) return res.json({ ...req.user, isGuest: false })
   if (req.session?.guestUser) return res.json(req.session.guestUser)
   res.json(null)
+})
+
+app.get('/api/ice', (req, res) => {
+  if (!req.user && !req.session?.guestUser) {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+  return res.json({ iceServers: buildIceServers() })
 })
 
 app.patch('/api/users/me', async (req, res) => {
