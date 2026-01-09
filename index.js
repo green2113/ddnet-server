@@ -61,6 +61,8 @@ const io = new SocketIOServer(httpServer, {
     origin: corsOriginHandler,
     credentials: true,
   },
+  pingInterval: 25000,
+  pingTimeout: 60000,
 })
 
 app.use(cors({ origin: corsOriginHandler, credentials: true }))
@@ -891,6 +893,44 @@ app.post('/api/users/me/avatar', upload.single('avatar'), async (req, res) => {
   }
 })
 
+app.get('/api/users/me/voice-volumes', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  try {
+    const current = await getUserById(user.id)
+    const volumes = current?.voiceVolumes && typeof current.voiceVolumes === 'object' ? current.voiceVolumes : {}
+    res.json({ volumes })
+  } catch (e) {
+    console.error('[voice] volumes fetch failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load volumes' })
+  }
+})
+
+app.patch('/api/users/me/voice-volumes', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const targetId = String(req.body?.targetId || '').trim()
+  const volumeRaw = Number(req.body?.volume)
+  if (!targetId) return res.status(400).json({ error: 'targetId required' })
+  if (!Number.isFinite(volumeRaw)) return res.status(400).json({ error: 'volume required' })
+  const volume = Math.min(200, Math.max(0, Math.round(volumeRaw)))
+  try {
+    const current = await getUserById(user.id)
+    if (!current) return res.status(404).json({ error: 'user not found' })
+    const nextVolumes = current.voiceVolumes && typeof current.voiceVolumes === 'object' ? { ...current.voiceVolumes } : {}
+    if (volume === 100) {
+      delete nextVolumes[targetId]
+    } else {
+      nextVolumes[targetId] = volume
+    }
+    await updateUserById(user.id, { voiceVolumes: nextVolumes })
+    res.json({ ok: true, volumes: nextVolumes })
+  } catch (e) {
+    console.error('[voice] volumes update failed', e?.message || e)
+    res.status(500).json({ error: 'failed to update volume' })
+  }
+})
+
 app.post('/auth/guest', (req, res) => {
   const name = String(req.body?.name || '').trim()
   if (!name) return res.status(400).json({ error: 'name required' })
@@ -1042,7 +1082,7 @@ app.post('/api/servers/:serverId/icon', upload.single('icon'), async (req, res) 
           : file.mimetype === 'image/gif'
             ? '.gif'
             : ''
-  const key = `servers/${serverId}/icon${ext || ''}`
+  const key = `icons/${serverId}`
   try {
     await r2Client.send(
       new PutObjectCommand({
@@ -1725,6 +1765,33 @@ const setScreenShareActive = (channelId, peerId, active) => {
   activeScreenShares.get(channelId).add(peerId)
 }
 
+const removeUserFromAllVoiceChannels = (userId, exceptSocketId = '') => {
+  if (!userId) return
+  voiceMembersByUser.forEach((membersByUser, channelId) => {
+    const existingSocketId = membersByUser.get(userId)
+    if (!existingSocketId || existingSocketId === exceptSocketId) return
+    const channelMembers = voiceMembers.get(channelId)
+    if (activeScreenShares.has(channelId) && activeScreenShares.get(channelId).has(existingSocketId)) {
+      setScreenShareActive(channelId, existingSocketId, false)
+      io.to(`voice:${channelId}`).emit('screen:announce', { channelId, peerId: existingSocketId, active: false })
+    }
+    if (channelMembers?.has(existingSocketId)) {
+      channelMembers.delete(existingSocketId)
+      if (channelMembers.size === 0) {
+        voiceMembers.delete(channelId)
+        voiceMembersByUser.delete(channelId)
+        voiceCallStartTimes.delete(channelId)
+      }
+      io.to(`voice:${channelId}`).emit('voice:leave', { channelId, peerId: existingSocketId })
+    }
+    const existingSocket = io.sockets.sockets.get(existingSocketId)
+    existingSocket?.leave(`voice:${channelId}`)
+    io.to(existingSocketId).emit('voice:force-leave', { channelId })
+    membersByUser.delete(userId)
+    emitVoiceMembers(channelId)
+  })
+}
+
 io.on('connection', (socket) => {
   const reloadSession = () =>
     new Promise((resolve) => {
@@ -1936,6 +2003,7 @@ io.on('connection', (socket) => {
     const channelMembers = voiceMembers.get(channelId)
     const channelMembersByUser = voiceMembersByUser.get(channelId)
     const userId = sessUser.id
+    removeUserFromAllVoiceChannels(userId, socket.id)
     if (userId) {
       const existingSocketId = channelMembersByUser.get(userId)
       if (existingSocketId && existingSocketId !== socket.id) {
