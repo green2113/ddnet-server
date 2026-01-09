@@ -349,6 +349,35 @@ const insertInvite = async (invite) => {
   invites.push(invite)
 }
 
+const listInvitesByServer = async (serverId) => {
+  if (!serverId) return []
+  let rows = []
+  if (invitesCol) {
+    rows = await invitesCol
+      .find({ serverId }, { projection: { _id: 0 } })
+      .sort({ createdAt: -1 })
+      .toArray()
+  } else {
+    rows = invites.filter((invite) => invite.serverId === serverId)
+  }
+  return rows.map((invite) => ({
+    ...invite,
+    expired: isInviteExpired(invite),
+    uses: Number.isFinite(invite.uses) ? invite.uses : 0,
+  }))
+}
+
+const deleteInviteByCode = async (code) => {
+  if (!code) return false
+  if (invitesCol) {
+    const result = await invitesCol.deleteOne({ code })
+    return result.deletedCount > 0
+  }
+  const before = invites.length
+  invites = invites.filter((invite) => invite.code !== code)
+  return invites.length !== before
+}
+
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 const isInviteExpired = (invite) => {
@@ -1598,6 +1627,40 @@ app.post('/api/servers/:serverId/invites', async (req, res) => {
   } catch (e) {
     console.error('[invites] create failed', e?.message || e)
     res.status(500).json({ error: 'failed to create invite' })
+  }
+})
+
+app.get('/api/servers/:serverId/invites', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  if (!serverId) return res.status(400).json({ error: 'serverId required' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  try {
+    const list = await listInvitesByServer(serverId)
+    res.json(list)
+  } catch (e) {
+    console.error('[invites] list failed', e?.message || e)
+    res.status(500).json({ error: 'failed to list invites' })
+  }
+})
+
+app.delete('/api/servers/:serverId/invites/:code', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const serverId = String(req.params.serverId || '')
+  const code = String(req.params.code || '').trim()
+  if (!serverId || !code) return res.status(400).json({ error: 'invalid request' })
+  if (!await isServerAdmin(user.id, serverId)) return res.status(403).json({ error: 'forbidden' })
+  try {
+    const invite = await getInviteByCode(code)
+    if (!invite || invite.serverId !== serverId) return res.status(404).json({ error: 'invite not found' })
+    const removed = await deleteInviteByCode(code)
+    if (!removed) return res.status(404).json({ error: 'invite not found' })
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[invites] delete failed', e?.message || e)
+    res.status(500).json({ error: 'failed to delete invite' })
   }
 })
 
