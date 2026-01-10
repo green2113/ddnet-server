@@ -133,6 +133,9 @@ let invites = []
 let channels = []
 let serverOrders = new Map()
 let serverBans = []
+let friendRequests = []
+let friendships = []
+let dmChannels = []
 
 const isServerMember = async (userId, serverId) => {
   if (!userId || !serverId) return false
@@ -286,6 +289,141 @@ const removeServerBan = async (serverId, userId) => {
     return
   }
   serverBans = serverBans.filter((ban) => !(ban.serverId === serverId && ban.userId === userId))
+}
+
+const buildPairKey = (a, b) => [String(a), String(b)].sort().join(':')
+
+const listFriends = async (userId) => {
+  if (!userId) return []
+  if (friendshipsCol) {
+    const rows = await friendshipsCol.find({ userId }, { projection: { _id: 0 } }).toArray()
+    return rows.map((row) => row.friendId)
+  }
+  return friendships.filter((row) => row.userId === userId).map((row) => row.friendId)
+}
+
+const areFriends = async (userId, friendId) => {
+  if (!userId || !friendId) return false
+  if (friendshipsCol) {
+    const row = await friendshipsCol.findOne({ userId, friendId }, { projection: { _id: 0 } })
+    return !!row
+  }
+  return friendships.some((row) => row.userId === userId && row.friendId === friendId)
+}
+
+const addFriendship = async (userId, friendId) => {
+  if (!userId || !friendId) return
+  const record = { userId, friendId, createdAt: Date.now() }
+  if (friendshipsCol) {
+    await friendshipsCol.updateOne({ userId, friendId }, { $set: record }, { upsert: true })
+    return
+  }
+  const idx = friendships.findIndex((row) => row.userId === userId && row.friendId === friendId)
+  if (idx >= 0) friendships[idx] = record
+  else friendships.push(record)
+}
+
+const removeFriendship = async (userId, friendId) => {
+  if (!userId || !friendId) return
+  if (friendshipsCol) {
+    await friendshipsCol.deleteOne({ userId, friendId })
+    return
+  }
+  friendships = friendships.filter((row) => !(row.userId === userId && row.friendId === friendId))
+}
+
+const listFriendRequests = async (userId) => {
+  if (!userId) return []
+  if (friendRequestsCol) {
+    return friendRequestsCol.find({ $or: [{ fromId: userId }, { toId: userId }] }, { projection: { _id: 0 } }).toArray()
+  }
+  return friendRequests.filter((row) => row.fromId === userId || row.toId === userId)
+}
+
+const findFriendRequest = async (fromId, toId) => {
+  if (!fromId || !toId) return null
+  if (friendRequestsCol) {
+    return friendRequestsCol.findOne({ fromId, toId }, { projection: { _id: 0 } })
+  }
+  return friendRequests.find((row) => row.fromId === fromId && row.toId === toId) || null
+}
+
+const findFriendRequestById = async (id) => {
+  if (!id) return null
+  if (friendRequestsCol) {
+    return friendRequestsCol.findOne({ id }, { projection: { _id: 0 } })
+  }
+  return friendRequests.find((row) => row.id === id) || null
+}
+
+const createFriendRequest = async (fromId, toId) => {
+  const record = { id: generateSnowflakeId(), fromId, toId, createdAt: Date.now() }
+  if (friendRequestsCol) {
+    await friendRequestsCol.insertOne(record)
+    return record
+  }
+  friendRequests.push(record)
+  return record
+}
+
+const removeFriendRequest = async (id) => {
+  if (!id) return false
+  if (friendRequestsCol) {
+    const result = await friendRequestsCol.deleteOne({ id })
+    return result.deletedCount > 0
+  }
+  const before = friendRequests.length
+  friendRequests = friendRequests.filter((row) => row.id !== id)
+  return friendRequests.length !== before
+}
+
+const getDmChannelById = async (channelId) => {
+  if (!channelId) return null
+  if (dmChannelsCol) {
+    return dmChannelsCol.findOne({ id: channelId }, { projection: { _id: 0 } })
+  }
+  return dmChannels.find((row) => row.id === channelId) || null
+}
+
+const getDmChannelByPair = async (userId, otherId) => {
+  if (!userId || !otherId) return null
+  const pairKey = buildPairKey(userId, otherId)
+  if (dmChannelsCol) {
+    return dmChannelsCol.findOne({ pairKey }, { projection: { _id: 0 } })
+  }
+  return dmChannels.find((row) => row.pairKey === pairKey) || null
+}
+
+const createDmChannel = async (userId, otherId) => {
+  const pairKey = buildPairKey(userId, otherId)
+  const record = { id: generateSnowflakeId(), userIds: [userId, otherId], pairKey, createdAt: Date.now() }
+  if (dmChannelsCol) {
+    await dmChannelsCol.insertOne(record)
+    return record
+  }
+  dmChannels.push(record)
+  return record
+}
+
+const ensureDmChannel = async (userId, otherId) => {
+  const existing = await getDmChannelByPair(userId, otherId)
+  if (existing) return existing
+  return createDmChannel(userId, otherId)
+}
+
+const listDmChannelsForUser = async (userId) => {
+  if (!userId) return []
+  if (dmChannelsCol) {
+    return dmChannelsCol.find({ userIds: userId }, { projection: { _id: 0 } }).toArray()
+  }
+  return dmChannels.filter((row) => Array.isArray(row.userIds) && row.userIds.includes(userId))
+}
+
+const isDmMember = async (userId, channelId) => {
+  if (!userId || !channelId) return false
+  const channel = await getDmChannelById(channelId)
+  if (!channel) return false
+  return Array.isArray(channel.userIds) && channel.userIds.includes(userId)
 }
 
 const getServerById = async (serverId) => {
@@ -454,6 +592,9 @@ let invitesCol
 let usersCol
 let serverOrdersCol
 let serverBansCol
+let friendRequestsCol
+let friendshipsCol
+let dmChannelsCol
 const users = []
 async function initMongo() {
   const uri = process.env.MONGODB_URI
@@ -492,6 +633,15 @@ async function initMongo() {
   await serverOrdersCol.createIndex({ userId: 1 }, { unique: true })
   serverBansCol = db.collection(process.env.MONGO_BANS_COLL || 'server_bans')
   await serverBansCol.createIndex({ serverId: 1, userId: 1 }, { unique: true })
+  friendRequestsCol = db.collection(process.env.MONGO_FRIEND_REQUESTS_COLL || 'friend_requests')
+  await friendRequestsCol.createIndex({ fromId: 1, toId: 1 }, { unique: true })
+  await friendRequestsCol.createIndex({ toId: 1 })
+  friendshipsCol = db.collection(process.env.MONGO_FRIENDS_COLL || 'friends')
+  await friendshipsCol.createIndex({ userId: 1, friendId: 1 }, { unique: true })
+  await friendshipsCol.createIndex({ userId: 1 })
+  dmChannelsCol = db.collection(process.env.MONGO_DM_CHANNELS_COLL || 'dm_channels')
+  await dmChannelsCol.createIndex({ pairKey: 1 }, { unique: true })
+  await dmChannelsCol.createIndex({ userIds: 1 })
   const serverCount = await serversCol.countDocuments()
   if (serverCount === 0) {
     const ownerId = DEFAULT_ADMIN_IDS[0] || 'system'
@@ -720,6 +870,14 @@ const toPublicUser = (user) => ({
   avatar: user.avatar || null,
   email: user.email,
   authType: user.authType || 'local',
+})
+
+const toUserSummary = (user) => ({
+  id: user.id,
+  username: user.username,
+  displayName: user.displayName,
+  avatar: user.avatar || null,
+  isGuest: !!user.isGuest,
 })
 
 const updateUserById = async (id, updates) => {
@@ -957,6 +1115,174 @@ app.patch('/api/users/me/voice-volumes', async (req, res) => {
   } catch (e) {
     console.error('[voice] volumes update failed', e?.message || e)
     res.status(500).json({ error: 'failed to update volume' })
+  }
+})
+
+app.get('/api/friends', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  try {
+    const friendIds = await listFriends(user.id)
+    if (!friendIds.length) return res.json([])
+    let rows = []
+    if (usersCol) {
+      rows = await usersCol.find({ id: { $in: friendIds } }, { projection: { _id: 0 } }).toArray()
+    } else {
+      rows = users.filter((row) => friendIds.includes(row.id))
+    }
+    const map = new Map(rows.map((row) => [row.id, toUserSummary(row)]))
+    res.json(friendIds.map((id) => map.get(id) || { id, username: id, displayName: id, avatar: null }))
+  } catch (e) {
+    console.error('[friends] list failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load friends' })
+  }
+})
+
+app.get('/api/friends/requests', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  try {
+    const rows = await listFriendRequests(user.id)
+    const ids = Array.from(new Set(rows.flatMap((row) => [row.fromId, row.toId]))).filter((id) => id !== user.id)
+    let usersMap = new Map()
+    if (ids.length) {
+      let userRows = []
+      if (usersCol) {
+        userRows = await usersCol.find({ id: { $in: ids } }, { projection: { _id: 0 } }).toArray()
+      } else {
+        userRows = users.filter((row) => ids.includes(row.id))
+      }
+      usersMap = new Map(userRows.map((row) => [row.id, toUserSummary(row)]))
+    }
+    const result = rows.map((row) => {
+      const direction = row.toId === user.id ? 'incoming' : 'outgoing'
+      const otherId = row.toId === user.id ? row.fromId : row.toId
+      return {
+        id: row.id,
+        direction,
+        createdAt: row.createdAt,
+        user: usersMap.get(otherId) || { id: otherId, username: otherId, displayName: otherId, avatar: null },
+      }
+    })
+    res.json(result)
+  } catch (e) {
+    console.error('[friends] requests failed', e?.message || e)
+    res.status(500).json({ error: 'failed to load requests' })
+  }
+})
+
+app.post('/api/friends/requests', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const rawHandle = normalizeHandle(req.body?.username)
+  if (!rawHandle || !isValidHandle(rawHandle)) return res.status(400).json({ error: 'username invalid' })
+  try {
+    const target = await findUserByHandle(rawHandle)
+    if (!target) return res.status(404).json({ error: 'user not found' })
+    if (target.id === user.id) return res.status(400).json({ error: 'cannot friend yourself' })
+    if (await areFriends(user.id, target.id)) return res.status(409).json({ error: 'already friends' })
+    const existing = await findFriendRequest(user.id, target.id)
+    if (existing) {
+      return res.json({ status: 'pending', request: existing })
+    }
+    const reverse = await findFriendRequest(target.id, user.id)
+    if (reverse) {
+      await removeFriendRequest(reverse.id)
+      await addFriendship(user.id, target.id)
+      await addFriendship(target.id, user.id)
+      const dm = await ensureDmChannel(user.id, target.id)
+      return res.status(201).json({ status: 'accepted', dmChannel: { id: dm.id, user: toUserSummary(target) } })
+    }
+    const request = await createFriendRequest(user.id, target.id)
+    res.status(201).json({ status: 'pending', request })
+  } catch (e) {
+    console.error('[friends] request failed', e?.message || e)
+    res.status(500).json({ error: 'failed to create request' })
+  }
+})
+
+app.post('/api/friends/requests/:id/accept', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const requestId = String(req.params.id || '')
+  if (!requestId) return res.status(400).json({ error: 'requestId required' })
+  try {
+    const request = await findFriendRequestById(requestId)
+    if (!request) return res.status(404).json({ error: 'request not found' })
+    if (request.toId !== user.id) return res.status(403).json({ error: 'forbidden' })
+    await removeFriendRequest(requestId)
+    await addFriendship(user.id, request.fromId)
+    await addFriendship(request.fromId, user.id)
+    const dm = await ensureDmChannel(user.id, request.fromId)
+    const otherUser = await getUserById(request.fromId)
+    res.json({ ok: true, dmChannel: { id: dm.id, user: otherUser ? toUserSummary(otherUser) : null } })
+  } catch (e) {
+    console.error('[friends] accept failed', e?.message || e)
+    res.status(500).json({ error: 'failed to accept request' })
+  }
+})
+
+app.post('/api/friends/requests/:id/reject', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const requestId = String(req.params.id || '')
+  if (!requestId) return res.status(400).json({ error: 'requestId required' })
+  try {
+    const request = await findFriendRequestById(requestId)
+    if (!request) return res.status(404).json({ error: 'request not found' })
+    if (request.toId !== user.id) return res.status(403).json({ error: 'forbidden' })
+    await removeFriendRequest(requestId)
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[friends] reject failed', e?.message || e)
+    res.status(500).json({ error: 'failed to reject request' })
+  }
+})
+
+app.delete('/api/friends/:id', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  const friendId = String(req.params.id || '')
+  if (!friendId) return res.status(400).json({ error: 'friendId required' })
+  try {
+    await removeFriendship(user.id, friendId)
+    await removeFriendship(friendId, user.id)
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[friends] remove failed', e?.message || e)
+    res.status(500).json({ error: 'failed to remove friend' })
+  }
+})
+
+app.get('/api/dms', async (req, res) => {
+  const user = getSessionUser(req)
+  if (!user || user.isGuest) return res.status(401).json({ error: 'unauthorized' })
+  try {
+    const list = await listDmChannelsForUser(user.id)
+    const otherIds = Array.from(
+      new Set(list.flatMap((row) => row.userIds || []).filter((id) => id !== user.id)),
+    )
+    let rows = []
+    if (otherIds.length) {
+      if (usersCol) {
+        rows = await usersCol.find({ id: { $in: otherIds } }, { projection: { _id: 0 } }).toArray()
+      } else {
+        rows = users.filter((row) => otherIds.includes(row.id))
+      }
+    }
+    const map = new Map(rows.map((row) => [row.id, toUserSummary(row)]))
+    const payload = list.map((row) => {
+      const otherId = (row.userIds || []).find((id) => id !== user.id) || ''
+      return {
+        id: row.id,
+        user: map.get(otherId) || (otherId ? { id: otherId, username: otherId, displayName: otherId, avatar: null } : null),
+        createdAt: row.createdAt,
+      }
+    })
+    res.json(payload)
+  } catch (e) {
+    console.error('[dm] list failed', e?.message || e)
+    res.status(500).json({ error: 'failed to list dms' })
   }
 })
 
@@ -1731,9 +2057,17 @@ app.get('/api/history', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, MESSAGE_HISTORY_LIMIT)
   const channelId = String(req.query.channelId || 'general')
   const channel = await getChannelById(channelId)
-  if (!channel) return res.status(404).json({ error: 'channel not found' })
-  const member = await isSessionMember(user, channel.serverId, req.session)
-  if (!member) return res.status(403).json({ error: 'forbidden' })
+  const dmChannel = channel ? null : await getDmChannelById(channelId)
+  if (channel) {
+    const member = await isSessionMember(user, channel.serverId, req.session)
+    if (!member) return res.status(403).json({ error: 'forbidden' })
+  } else if (dmChannel) {
+    if (user.isGuest) return res.status(403).json({ error: 'forbidden' })
+    const isMember = Array.isArray(dmChannel.userIds) && dmChannel.userIds.includes(user.id)
+    if (!isMember) return res.status(403).json({ error: 'forbidden' })
+  } else {
+    return res.status(404).json({ error: 'channel not found' })
+  }
   if (messagesCol) {
     try {
       const rows = await messagesCol
@@ -1762,9 +2096,16 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   const channelId = String(req.body?.channelId || '')
   if (!channelId) return res.status(400).json({ error: 'channelId required' })
   const channel = await getChannelById(channelId)
-  if (!channel) return res.status(404).json({ error: 'channel not found' })
-  const member = await isServerMember(user.id, channel.serverId)
-  if (!member) return res.status(403).json({ error: 'forbidden' })
+  const dmChannel = channel ? null : await getDmChannelById(channelId)
+  if (channel) {
+    const member = await isServerMember(user.id, channel.serverId)
+    if (!member) return res.status(403).json({ error: 'forbidden' })
+  } else if (dmChannel) {
+    const isMember = Array.isArray(dmChannel.userIds) && dmChannel.userIds.includes(user.id)
+    if (!isMember) return res.status(403).json({ error: 'forbidden' })
+  } else {
+    return res.status(404).json({ error: 'channel not found' })
+  }
   const file = req.file
   if (!file) return res.status(400).json({ error: 'file required' })
   if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
@@ -1801,6 +2142,7 @@ io.use((socket, next) => {
 const voiceMembers = new Map()
 const voiceMembersByUser = new Map()
 const activeScreenShares = new Map()
+const userSockets = new Map()
 const voiceCallStartTimes = new Map()
 
 const emitVoiceMembers = (channelId) => {
@@ -1872,6 +2214,29 @@ io.on('connection', (socket) => {
   }
   const isSocketInVoiceChannel = (channelId, socketId) =>
     Boolean(voiceMembers.get(channelId)?.has(socketId))
+
+  const attachSocketUser = async () => {
+    const sessUser = await resolveSessionUser()
+    if (!sessUser?.id) return
+    const existing = userSockets.get(sessUser.id) || new Set()
+    existing.add(socket.id)
+    userSockets.set(sessUser.id, existing)
+  }
+
+  const detachSocketUser = async () => {
+    const sessUser = await resolveSessionUser()
+    if (!sessUser?.id) return
+    const existing = userSockets.get(sessUser.id)
+    if (!existing) return
+    existing.delete(socket.id)
+    if (existing.size === 0) userSockets.delete(sessUser.id)
+  }
+
+  attachSocketUser().catch(() => {})
+
+  socket.on('disconnect', () => {
+    detachSocketUser().catch(() => {})
+  })
 
   socket.on('voice:watch', async (payload) => {
     const channelId = String(payload?.channelId || '')
@@ -1947,10 +2312,16 @@ io.on('connection', (socket) => {
     }
     const channelId = typeof payload?.channelId === 'string' ? payload.channelId : 'general'
     const channel = await getChannelById(channelId)
-    if (!channel) return
-    const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
-    if (!member) return
-    if (channel.hidden && !await isServerAdmin(sessUser?.id, channel.serverId)) return
+    const dmChannel = channel ? null : await getDmChannelById(channelId)
+    if (!channel && !dmChannel) return
+    if (channel) {
+      const member = await isSessionMember(sessUser, channel.serverId, socket.request?.session)
+      if (!member) return
+      if (channel.hidden && !await isServerAdmin(sessUser?.id, channel.serverId)) return
+    } else {
+      if (sessUser.isGuest) return
+      if (!Array.isArray(dmChannel.userIds) || !dmChannel.userIds.includes(sessUser.id)) return
+    }
     const message = {
       id: generateSnowflakeId(),
       author: {
@@ -1966,7 +2337,16 @@ io.on('connection', (socket) => {
     }
 
     // Broadcast to web clients
-    io.emit('chat:message', message)
+    if (dmChannel) {
+      const targetIds = Array.isArray(dmChannel.userIds) ? dmChannel.userIds : []
+      targetIds.forEach((userId) => {
+        const sockets = userSockets.get(userId)
+        if (!sockets) return
+        sockets.forEach((socketId) => io.to(socketId).emit('chat:message', message))
+      })
+    } else {
+      io.emit('chat:message', message)
+    }
 
     // Persist
     if (messagesCol) {
@@ -2012,10 +2392,17 @@ io.on('connection', (socket) => {
       }
       if (!target?.channelId) return
       const channel = await getChannelById(target.channelId)
-      if (!channel) return
-      const member = await isServerMember(sessUser.id, channel.serverId)
-      if (!member) return
-      const canDeleteAny = await isServerAdmin(sessUser.id, channel.serverId)
+      const dmChannel = channel ? null : await getDmChannelById(target.channelId)
+      if (!channel && !dmChannel) return
+      let canDeleteAny = false
+      if (channel) {
+        const member = await isServerMember(sessUser.id, channel.serverId)
+        if (!member) return
+        canDeleteAny = await isServerAdmin(sessUser.id, channel.serverId)
+      } else {
+        if (sessUser.isGuest) return
+        if (!Array.isArray(dmChannel.userIds) || !dmChannel.userIds.includes(sessUser.id)) return
+      }
       const authorId = target?.author?.id || target?.user_id
       if (!authorId || (authorId !== sessUser.id && !canDeleteAny)) return
       if (messagesCol) {
@@ -2030,7 +2417,16 @@ io.on('connection', (socket) => {
       }
 
       if (deleted) {
-        io.emit('chat:delete', messageId)
+        if (dmChannel) {
+          const targetIds = Array.isArray(dmChannel.userIds) ? dmChannel.userIds : []
+          targetIds.forEach((userId) => {
+            const sockets = userSockets.get(userId)
+            if (!sockets) return
+            sockets.forEach((socketId) => io.to(socketId).emit('chat:delete', messageId))
+          })
+        } else {
+          io.emit('chat:delete', messageId)
+        }
       }
     } catch (err) {
       console.error('[delete] failed', err?.message || err)
